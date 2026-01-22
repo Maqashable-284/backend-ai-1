@@ -304,13 +304,16 @@ class FunctionCallingLoop:
             if hasattr(response, 'candidates') and response.candidates:
                 candidate = response.candidates[0]
                 if hasattr(candidate, 'content') and candidate.content:
-                    for part in candidate.content.parts:
-                        await self._process_part(
-                            part,
-                            text_parts,
-                            function_calls,
-                            thoughts,
-                        )
+                    # DEFENSIVE: Check parts is not None before iterating
+                    parts = candidate.content.parts
+                    if parts is not None:
+                        for part in parts:
+                            await self._process_part(
+                                part,
+                                text_parts,
+                                function_calls,
+                                thoughts,
+                            )
 
             # Also check response.text as fallback
             if not text_parts and hasattr(response, 'text') and response.text:
@@ -626,14 +629,22 @@ class FunctionCallingLoop:
             async for chunk in stream:
                 if hasattr(chunk, 'candidates') and chunk.candidates:
                     candidate = chunk.candidates[0]
+                    
+                    # Log finish reason if present
+                    if hasattr(candidate, 'finish_reason') and candidate.finish_reason:
+                        logger.debug(f"Chunk finish_reason: {candidate.finish_reason}")
+
                     if hasattr(candidate, 'content') and candidate.content:
-                        for part in candidate.content.parts:
-                            await self._process_part(
-                                part,
-                                text_parts,
-                                function_calls,
-                                thoughts,
-                            )
+                        # DEFENSIVE: Check parts is not None before iterating
+                        parts = candidate.content.parts
+                        if parts is not None:
+                            for part in parts:
+                                await self._process_part(
+                                    part,
+                                    text_parts,
+                                    function_calls,
+                                    thoughts,
+                                )
 
         except Exception as e:
             logger.error(f"Streaming round error: {e}", exc_info=True)

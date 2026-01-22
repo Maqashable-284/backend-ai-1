@@ -206,10 +206,29 @@ class GeminiAdapter:
             parts = []
 
             for part in entry.get("parts", []):
+                # 1. Text Parts
                 if "text" in part and part["text"]:
                     parts.append(Part.from_text(text=part["text"]))
-                # Function calls and responses are typically not needed in history
-                # as they're ephemeral within a session
+                
+                # 2. Function Calls (Model role)
+                elif "function_call" in part and part["function_call"]:
+                    fc = part["function_call"]
+                    parts.append(
+                        Part.from_function_call(
+                            name=fc["name"],
+                            args=fc.get("args", {})
+                        )
+                    )
+                
+                # 3. Function Responses (User role)
+                elif "function_response" in part and part["function_response"]:
+                    fr = part["function_response"]
+                    parts.append(
+                        Part.from_function_response(
+                            name=fr["name"],
+                            response=fr["response"]
+                        )
+                    )
 
             if parts:
                 if role == "user":
@@ -500,7 +519,12 @@ class GeminiAdapter:
         if not hasattr(candidate, 'content') or not candidate.content:
             return result
 
-        for part in candidate.content.parts:
+        # DEFENSIVE: Check parts is not None before iterating
+        parts = candidate.content.parts
+        if parts is None:
+            return result
+
+        for part in parts:
             # Check for thought
             if hasattr(part, 'thought') and part.thought:
                 thought_text = getattr(part, 'text', '') or ''

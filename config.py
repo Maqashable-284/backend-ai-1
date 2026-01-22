@@ -71,10 +71,10 @@ class Settings(BaseModel):
         default_factory=lambda: int(os.getenv("MAX_OUTPUT_TOKENS", "8192"))
     )
     # FIX: Maximum function calls for automatic function calling
-    # CRITICAL: Reduced to 3 to prevent Gemini from calling search_products multiple times!
-    # Each extra call adds ~3-5s latency. 3 calls max: 1 search + 1 profile + 1 details
+    # Increased to 5 to prevent EmptyResponseError on complex queries
+    # Each extra call adds ~3-5s latency but prevents empty response crashes
     max_function_calls: int = Field(
-        default_factory=lambda: int(os.getenv("MAX_FUNCTION_CALLS", "3"))
+        default_factory=lambda: int(os.getenv("MAX_FUNCTION_CALLS", "5"))
     )
 
     # Gemini Thinking Configuration (for real-time thought streaming)

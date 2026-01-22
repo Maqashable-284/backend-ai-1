@@ -91,7 +91,7 @@ class ConversationEngineConfig:
     default_mode: ResponseMode = ResponseMode.SYNC
 
     # Function calling settings
-    max_function_rounds: int = 3
+    max_function_rounds: int = 5  # Increased from 3 to prevent EmptyResponseError on complex queries
     max_unique_queries: int = 3
 
     # Timeout settings
@@ -329,6 +329,10 @@ class ConversationEngine:
             strategy=self.config.thinking_strategy,
         )
 
+        # CRITICAL: Track chat session for guaranteed save in finally block
+        chat = None
+        save_attempted = False
+
         try:
             # Phase 1: Yield initial thinking events (immediate feedback)
             for event in thinking_manager.get_initial_events(message):
@@ -410,12 +414,14 @@ class ConversationEngine:
             if snapshot.quick_replies:
                 yield SSEEvent("quick_replies", {"replies": snapshot.quick_replies})
 
-            # Phase 9: Save history
+            # Phase 9: Save history (will also be attempted in finally as backup)
+            save_attempted = True
             await self._save_context(context, chat)
 
-            # Done
+            # Done - include session_id so frontend can persist it for subsequent requests
             yield SSEEvent("done", {
                 "success": True,
+                "session_id": context.session_id,  # CRITICAL: Frontend needs this for session persistence
                 "elapsed_seconds": context.elapsed_seconds(),
                 "thinking_steps": thinking_manager.step_count,
             })
@@ -446,6 +452,21 @@ class ConversationEngine:
                 "message": error.message_georgian,
                 "can_retry": error.can_retry,
             })
+
+        finally:
+            # CRITICAL FIX: Guarantee history is saved even if an error occurred
+            # This prevents "amnesia" where history is lost on partial failures
+            if chat is not None and not save_attempted:
+                logger.warning(
+                    f"💾 FINALLY: Attempting backup save for session {context.session_id} "
+                    f"(save_attempted={save_attempted})"
+                )
+                try:
+                    await self._save_context(context, chat)
+                except Exception as save_error:
+                    logger.error(
+                        f"💾 FINALLY: Backup save failed for session {context.session_id}: {save_error}"
+                    )
 
     # =========================================================================
     # PIPELINE EXECUTION
@@ -532,6 +553,11 @@ class ConversationEngine:
             context: RequestContext to populate
         """
         # Load history
+        logger.info(
+            f"📥 _load_context START: user={context.user_id}, "
+            f"requested_session={context.session_id}"
+        )
+
         history, session_id, summary = await self.mongo.load_history(
             user_id=context.user_id,
             session_id=context.session_id,
@@ -544,12 +570,20 @@ class ConversationEngine:
         profile = await self.mongo.get_user_profile(context.user_id)
         context.user_profile = profile or {}
 
+        # CRITICAL LOG: Shows exactly what was loaded
         logger.info(
-            f"Loaded context: user={context.user_id}, "
+            f"📥 _load_context COMPLETE: user={context.user_id}, "
             f"session={context.session_id}, "
             f"history_len={len(context.history)}, "
-            f"has_profile={profile is not None}"
+            f"has_profile={profile is not None}, "
+            f"has_summary={summary is not None}"
         )
+
+        # DEBUG: Log first message if history exists (helps diagnose amnesia)
+        if context.history:
+            first_msg = context.history[0]
+            first_text = first_msg.get('parts', [{}])[0].get('text', '')[:100]
+            logger.debug(f"📥 First history message: {first_text}...")
 
     async def _save_context(self, context: RequestContext, chat: Any) -> None:
         """
@@ -559,16 +593,37 @@ class ConversationEngine:
             context: RequestContext with session info
             chat: Gemini chat session with history
         """
+        logger.info(
+            f"💾 _save_context START: user={context.user_id}, "
+            f"session={context.session_id}"
+        )
+
         try:
             # Get history from chat session
             history = chat.get_history() if hasattr(chat, 'get_history') else []
+            history_len = len(history) if history else 0
+
+            logger.info(
+                f"💾 Saving {history_len} messages to MongoDB for session {context.session_id}"
+            )
 
             # Save to MongoDB
-            await self.mongo.save_history(
+            save_success = await self.mongo.save_history(
                 user_id=context.user_id,
                 session_id=context.session_id,
                 history=history,
             )
+
+            if save_success:
+                logger.info(
+                    f"💾 _save_context SUCCESS: session={context.session_id}, "
+                    f"messages_saved={history_len}"
+                )
+            else:
+                logger.error(
+                    f"💾 _save_context FAILED (save_history returned False): "
+                    f"session={context.session_id}"
+                )
 
             # Increment user stats
             await self.mongo.increment_user_stats(
@@ -576,10 +631,11 @@ class ConversationEngine:
                 messages=2,  # User message + assistant response
             )
 
-            logger.info(f"Saved context for session {context.session_id}")
-
         except Exception as e:
-            logger.error(f"Failed to save context: {e}")
+            logger.error(
+                f"💾 _save_context EXCEPTION: session={context.session_id}, error={e}",
+                exc_info=True
+            )
             # Don't fail the request if save fails
 
     # =========================================================================
