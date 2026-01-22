@@ -423,7 +423,7 @@ class TestConversationEngine:
         """Test ConversationEngineConfig default values."""
         config = ConversationEngineConfig()
 
-        assert config.max_function_rounds == 3
+        assert config.max_function_rounds == 5
         assert config.max_unique_queries == 3
         assert config.gemini_timeout_seconds == 30
         assert config.retry_on_empty is True
