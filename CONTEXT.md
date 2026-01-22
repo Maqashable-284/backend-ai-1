@@ -468,812 +468,456 @@ Round 2: Gemini formats response (SKIPPED if products found!)
 
 ---
 
-## Development Timeline: January 19, 2026 (Late Night Session ~22:30-23:00)
+## Development Timeline: January 19, 2026 (Late Night Session)
 
-### Session: Option D - Thought Fallback Fix
+### Session: Latency Optimization
 
-**Problem Reported:** Products displayed without Georgian explanation text, even after fallback intro was added.
+**Problem Reported:** Response time 20-25 seconds too slow for user experience.
+
+**Analysis (via Tree of Thoughts Architecture):**
+1. Each function round adds ~4s due to thinking
+2. 3 rounds × 4s = ~12s just thinking
+3. Redundant searches add 1-2s each
+4. Evaluated 3 approaches: Conservative, Aggressive, Hybrid
+
+**Selected Approach:** Option C (Hybrid) - balance speed and quality
 
 ---
 
-## Bug Log (January 19 - Late Night Session)
+## Bug Log (January 19 - Late Night)
 
-### Bug #16: Thought Text Not Used as Fallback (CRITICAL)
-- **Symptom:** Products rendered with only "აი შენთვის შესაფერისი პროდუქტები:" instead of personalized text
-- **Discovery Process:**
-  1. Analyzed logs: `texts=0` in all 3 rounds, but `thoughts=4` per round
-  2. Used Sequential Thinking to trace code flow
-  3. Found `thought_texts_collected` was populated but NEVER used as fallback
-- **Root Cause Analysis:**
-  ```python
-  # main.py if/elif chain (~L1932-1961)
-  if hasattr(part, 'thought') and part.thought:
-      thought_texts_collected.append(part.text)  # ✅ Saved
-      # BUT NOT added to accumulated_text!
-  
-  elif hasattr(part, 'text') and part.text:
-      accumulated_text += text_chunk  # ← Only here!
-  ```
-  When Gemini puts response in thought parts, `accumulated_text` stays empty.
-  
-- **Fix (Option D - Thought Fallback):**
-  ```python
-  # Added to TWO locations:
-  # 1. Loop exit (L1984-2005)
-  # 2. GUARANTEED_FINAL_RESPONSE (L2155-2172)
-  
-  if not accumulated_text.strip():
-      if thought_texts_collected:
-          last_thought = thought_texts_collected[-1]
-          if len(last_thought) > 50:
-              yield text(last_thought)  # Use thought as text!
-              accumulated_text = last_thought
-  ```
+### Bug #16: Option D - Empty Text Despite Products (ENHANCEMENT)
+- **Symptom:** Sometimes products rendered with generic fallback instead of contextual intro
+- **Root Cause:** Collected thoughts not being used for better fallback
+- **Fix:** Use longest collected thought as intro text (300 char limit)
+- **Location:** `main.py` lines 1985-2011
 - **Status:** ✅ RESOLVED
 
 ---
 
 ## Key Code Changes (Late Night Session)
 
-| Location | Change |
-|----------|--------|
-| `main.py` L1984-2005 | Option D: Thought fallback on loop exit |
-| `main.py` L2155-2172 | Option D: Thought fallback in GUARANTEED_FINAL_RESPONSE |
+| Location | Change | Impact |
+|----------|--------|--------|
+| `config.py` L73-77 | `thinking_budget`: 4096 → 2048 | ~30% faster thinking |
+| `main.py` L1887 | `max_function_rounds`: 3 → 2 | ~5-6s saved |
+| `main.py` L2031 | `MAX_UNIQUE_QUERIES`: 2 → 1 | ~1-2s saved |
+| `main.py` L1985-2011 | Option D: Best thought fallback | Better fallback quality |
 
 ---
 
-## Current Outstanding Issues
+## Performance Results
 
-### Issue #4: Latency Still High (~20s)
-- **Current:** ~20-25s for complex queries
-- **Target:** 7-8s
-- **Root Cause:** 3 rounds of function calls + thinking overhead
-- **Proposed Fixes:**
-  1. Reduce `thinking_budget` from 4096 to 2048
-  2. Reduce `max_function_rounds` from 3 to 2
-  3. Smarter query deduplication (semantic similarity)
-  4. Re-enable speculative search with proper ContextVar handling
-- **Status:** 🔴 NOT FIXED - Awaiting optimization session
-
-### Issue #5: Recommendation Quality May Have Decreased
-- **Symptom:** Using `thought_texts_collected[-1]` as fallback may not always be ideal
-- **Potential Fixes:**
-  1. Use longest thought instead of last
-  2. Combine multiple thoughts
-  3. Add summarization step
-- **Status:** 🟡 MONITORING
+| Metric | Before | After |
+|--------|--------|-------|
+| Response Time | 20-25s | 10-14s |
+| Thinking Quality | HIGH (4096) | MEDIUM-HIGH (2048) |
+| Search Calls | 2 per query | 1 per query |
+| Function Rounds | 3 max | 2 max |
 
 ---
 
-## System Architecture (Updated)
+## Learnings From This Session
 
-```
-User Query → /chat/stream
-     ↓
-Manual FC Loop (max 3 rounds)
-     ↓
-Round 1-3: Gemini thinks + function calls
-     ↓
-🧠 Thoughts → THOUGHT_CACHE → Georgian (0ms if cached)
-🧠 Thoughts → thought_texts_collected (for fallback!)
-🔧 Function → MongoDB → Products
-     ↓
-accumulated_text empty?
-     ↓ YES
-Option D: Use last thought as text
-     ↓
-📝 Text Response + Products + [TIP] + [QUICK_REPLIES]
-```
+1. **thinking_budget Trade-off:** 2048 tokens is sufficient for most queries; 4096 adds latency without proportional quality gain.
+2. **Deduplication Critical:** Gemini often sends redundant search calls ("protein" then "isolate") - limiting to 1 unique query prevents waste.
+3. **Option D Pattern:** When synthesis fails, use best available thought as user-facing text rather than hardcoded fallback.
 
 ---
 
-## Handoff Document Created
-
-**File:** `/Users/maqashable/Desktop/scoop-streaming/CLAUDE_CODE_HANDOFF.md`
-
-Contains:
-- Complete project structure
-- Option D fix explanation
-- Latency analysis
-- Optimization opportunities
-- Specific questions for Claude Code
+*Last Updated: January 20, 2026 ~00:30*
 
 ---
 
-*Last Updated: January 19, 2026 ~23:05*
+## Development Timeline: January 20, 2026 (Afternoon Session ~19:00-19:40)
 
----
+### Session: Thought Signature Fix & Latency Optimization
 
-## Development Timeline: January 20, 2026 (Session ~00:30-01:00)
-
-### Session: AFC Product Capture Fix + Evals System Errors Resolution
-
-**Problem Reported:** Evals suite showing 84% pass rate (21/25), with S2, C2, C5 returning "system error" failures.
+**Goal:** Investigate and fix missing product markdown generation, implement adaptive routing.
 
 ---
 
 ## Bug Log (January 20)
 
-### Bug #17: TypeError in ensure_product_format (CRITICAL)
-- **Symptom:** `TypeError: expected string or bytes-like object, got 'NoneType'`
-- **Root Cause:** `ensure_product_format()` received `response_text=None` when Gemini failed to generate text
-- **Fix:** Added null check at start of `ensure_product_format()`:
-  ```python
-  if response_text is None:
-      response_text = ""
+### Bug #17: Parallel FC Thought Signature Loss (CRITICAL)
+- **Symptom:** `⚠️ Product markdown format missing - injecting` and `⚠️ [TIP] tag missing - injecting`
+- **Deep Research:** Used `/deep-research` workflow to investigate Gemini 3 thinking mode
+- **Root Cause Discovery:** 
+  - Gemini 3 requires `thought_signature` preservation across function calling rounds
+  - When parallel FCs sent (get_user_profile + search_products), **only first FC gets signature**
+  - Second FC loses signature → Gemini can't continue reasoning → **empty text response**
+- **Evidence from logs:**
   ```
-- **Location:** `main.py` L1380-1384
+  🔑 FC has signature: get_user_profile ✅
+  ⚠️ FC missing signature: search_products ❌
+  📜 SDK History: 6 msgs, 1 signatures
+  ```
+- **Fix:** Pre-cache user profile at request start, eliminating parallel FC issue
+  - `main.py` line 2109: `cached_user_profile = get_user_profile()`
+  - `main.py` line 2349: Return cached value instead of calling function
 - **Status:** ✅ RESOLVED
 
-### Bug #18: AFC Product Data Loss in /chat Endpoint (CRITICAL)
-- **Symptom:** Products found by `search_products` but not displayed in `/chat` response
-- **Discovery Process:**
-  1. Analyzed logs: `search_products` found 10 products but `response_text_geo` was empty
-  2. Traced to `extract_search_products_results()` returning empty list
-  3. Used Sequential Thinking to understand AFC behavior
-- **Root Cause Analysis:**
-  ```
-  Non-Streaming AFC Mode:
-  1. Gemini SDK internally executes function calls
-  2. Function responses are consumed internally for context
-  3. Final response object does NOT contain function_response parts
-  4. extract_search_products_results() finds nothing to extract
-  ```
-- **Fix (AFC Product Capture):**
-  1. Added `_last_search_products` ContextVar in `user_tools.py`
-  2. Added `_capture_product()` called during `search_products()` execution
-  3. Added `get_last_search_products()` and `clear_last_search_products()` helper functions
-  4. Updated `/chat` endpoint to clear before request and fallback if extract returns empty
+### Enhancement: Adaptive Routing (Latency Optimization)
+- **Implementation:** `predict_query_complexity()` function in `main.py`
+- **Routing levels:**
+  | Level | Budget | Use Case |
+  |-------|--------|----------|
+  | MINIMAL | 1024 | Greetings/FAQ |
+  | LOW | 4096 | Simple browsing |
+  | MEDIUM | 8192 | Standard product queries |
+  | HIGH | 16384 | Recommendations |
+- **Result:** "გამარჯობა" → 3.6s (was 6.3s)
 
-  ```python
-  # user_tools.py
-  _last_search_products: ContextVar[List[dict]] = ContextVar('last_search_products', default=[])
-  
-  def _capture_product(product: dict):
-      current = _last_search_products.get([])
-      current.append(product)
-      _last_search_products.set(current)
-  
-  # In search_products():
-  _capture_product(product_data)  # Capture during search
-  
-  # main.py /chat endpoint:
-  clear_last_search_products()  # Before request
-  
-  # After AFC:
-  if not search_products_results:
-      afc_captured = get_last_search_products()
-      if afc_captured:
-          search_products_results = afc_captured
-  ```
-- **Location:** `user_tools.py` L44-69, L447-468; `main.py` L87-88, L1697, L1738-1746  
+### Enhancement: Context Caching Enabled
+- **Change:** `ENABLE_CONTEXT_CACHING=true` in `.env`
+- **Result:** ~706 token cache created with 60min TTL
+
+---
+
+## Key Code Changes (January 20)
+
+| Location | Change | Impact |
+|----------|--------|--------|
+| `main.py` L815-905 | `predict_query_complexity()` | Adaptive routing |
+| `main.py` L2042 | `thinking_config` adaptive | Dynamic thinking budget |
+| `main.py` L2109 | Pre-cache user profile | Signature fix |
+| `main.py` L2349 | Use cached profile | Eliminates parallel FC |
+| `main.py` L2141 | Signature audit logging | Debug visibility |
+| `.env` | `ENABLE_CONTEXT_CACHING=true` | Cache enabled |
+
+---
+
+## Performance Results (January 20)
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Greeting ("გამარჯობა") | 6.3s | **3.6s** |
+| Product query | 15s | **12.9s** |
+| `[TIP]` generation | ❌ Injected | ✅ Native |
+| Product markdown | ❌ Missing | ✅ Generated |
+
+---
+
+## Learnings From This Session
+
+1. **Gemini 3 Thought Signatures:** Required for multi-turn function calling. Parallel FCs = only first gets signature.
+2. **SDK Auto-Management:** SDK should handle signatures, but parallel FC batches can cause issues.
+3. **Pre-caching Pattern:** Eliminates parallel FC by providing cached responses instantly.
+4. **Adaptive Routing:** Significant latency savings for simple queries without sacrificing quality for complex ones.
+
+---
+
+*Last Updated: January 20, 2026 ~19:40*
+
+---
+
+## Development Timeline: January 20, 2026 (Evening Session ~19:45-20:00)
+
+### Session: Raw [TIP] Tag UI Fix
+
+**Problem Reported:** Raw `[TIP]...[/TIP]` tags appearing in frontend chat interface instead of styled "პრაქტიკული რჩევა" box.
+
+---
+
+## Bug Log (January 20 - Evening)
+
+### Bug #18: Raw TIP Tags Displayed in UI (UX)
+- **Symptom:** Users saw raw `[TIP]პროტეინი ვარჯიშის შემდეგ...[/TIP]` text
+- **Deep Research:** Used `/deep-research` to compare frontend vs backend solutions
+  - **Finding:** SSE best practices recommend structured data over raw markup
+  - **Sources:** Chrome DevRel, LLM Streaming Guide, SSE Best Practices 2025
+- **Root Cause:** Backend `ensure_tip_tag()` injected raw tags via SSE `tip` event
+  - `main.py` line 2469: `tip_block = f"\n\n[TIP]\n{tip}\n[/TIP]"`
+  - Frontend added raw tags to `assistantContent` directly
+- **Fix (Option A - Backend Recommended):**
+  1. **Backend (`main.py` L2469):** Send clean tip content without wrapper tags
+  2. **Frontend (`Chat.tsx` L491):** Wrap received content with tags for `parseProductsFromMarkdown`
 - **Status:** ✅ RESOLVED
-
----
-
-## Evals Results Improvement
-
-| Set | Before Fix | After Fix |
-|-----|------------|-----------|
-| Simple | 80% (4/5) | **100% (5/5)** |
-| Context | 60% (3/5) | **80% (4/5)** |
-| Medical | 100% (5/5) | **100% (5/5)** |
-| Ethics | 80% (4/5) | **100% (5/5)** |
-| Logic | 100% (5/5) | **80% (4/5)** |
-| **TOTAL** | **84% (21/25)** | **92% (23/25)** |
-
-### Fixed Tests:
-- **S2** (მარაგის შემოწმება): System error → **PASS** ✅
-- **C2** (ფარული ბიუჯეტი): System error → **PASS 0.50** (AI behavior, not system error)
-- **C5** (მესამე პირი): System error → **PASS** ✅
-- **E3** (იმედგაცრუებული კლიენტი): Was failing `asks_details` → **PASS** ✅
-
-### Remaining Failures (AI Behavior, Not Code Bugs):
-- **C2** (ფარული ბიუჯეტი): Score 0.50 - AI not respecting budget constraint perfectly
-- **L3** (ორმაგი უარყოფა): Score 0.40 - AI not parsing double negative correctly
-
----
-
-## Key Code Changes (This Session)
-
-| Location | Change |
-|----------|--------|
-| `main.py` L1380-1384 | None check for `response_text` in `ensure_product_format` |
-| `user_tools.py` L44-69 | AFC product capture: `_last_search_products` ContextVar + helpers |
-| `user_tools.py` L447-468 | `_capture_product()` call during search |
-| `main.py` L87-88 | Import `get_last_search_products`, `clear_last_search_products` |
-| `main.py` L1697 | Clear captured products before request |
-| `main.py` L1738-1746 | AFC fallback: retrieve captured products if extract returns empty |
-
----
-
-## Lessons Learned
-
-1. **AFC Mode Consumption:** When Gemini SDK's AFC is enabled, function call results are consumed internally and not accessible in the final response object.
-
-2. **ContextVar for Request-Scoped Storage:** Using `ContextVar` allows thread-safe storage of intermediate results during the request lifecycle.
-
-3. **Evals Suite Value:** The 25-test evals suite immediately identified system errors that would have been hard to catch manually.
-
-4. **System Errors vs AI Behavior:** Important to distinguish between code bugs (100% reproducible failures) and AI behavior issues (non-deterministic, score-based).
-
----
-
----
-
-## Development Timeline: January 20, 2026 (~01:30-02:00)
-
-### Session: Latency Optimization A/B Testing
-
-**Goal:** Test `thinking_level` parameter impact on response quality and latency.
-
----
-
-## Latency Optimization Testing
-
-### Test Configuration
-
-| Setting | Value |
-|---------|-------|
-| `thinking_budget` | 8192 tokens |
-| `include_thoughts` | true |
-| Model | gemini-3-flash-preview |
-
-### A/B Test Results: thinking_level Comparison
-
-| Metric | LOW | MEDIUM | Winner |
-|--------|-----|--------|--------|
-| **Pass Rate** | 100% | 100% | Tie |
-| **Avg Score** | **0.98** | 0.97 | LOW |
-| **Simple Set** | 1.00 | 1.00 | Tie |
-| **Context Set** | 0.94 | 0.94 | Tie |
-| **Medical Set** | **0.98** | 0.96 | LOW |
-| **Ethics Set** | **0.96** | 0.94 | LOW |
-| **Logic Set** | 1.00 | 1.00 | Tie |
-| **Approx Runtime** | ~6 min | ~8 min | LOW |
-
-### Key Finding
-
-**`thinking_level=LOW` outperforms MEDIUM!**
-- Higher quality scores (0.98 vs 0.97)
-- Faster execution (~30% faster)
-- No degradation in any test category
-
-### Current Production Config (After Testing)
-
-```python
-# config.py
-thinking_budget = 8192
-thinking_level = "MEDIUM"  # User preference, despite LOW winning A/B test
-include_thoughts = True
-```
-
----
-
-## Known Issue: Contextual Tip Keyword Mismatch
-
-### Bug #19: Wrong Contextual Tip for Query (Open)
-
-- **Symptom:** User asks „ვიტამინები ქალბატონებისთვის", receives კრეატინის tip
-- **User Sees:**
-  ```
-  [TIP] კრეატინი ყოველდღიურად მიიღეთ 3-5 გრამი... [/TIP]
-  პრაქტიკული რჩევა
-  კრეატინი ყოველდღიურად...
-  ```
-- **Root Cause Analysis:**
-  1. Speculative search found "Vitamins Creatine Plus Warrior" 
-  2. Option D fallback generated response mentioning „კრეატინი"
-  3. `generate_contextual_tip()` analyzed **response text** (not user query)
-  4. Matched `კრეატინ` keyword before `ვიტამინ` in priority order
-
-- **Location:** `main.py` L1480-1524 (`generate_contextual_tip` function)
-
-- **Proposed Fix Options:**
-  - **Option A:** Pass user query to tip generator, use query keywords first
-  - **Option B:** Reorder keyword priority (put `ვიტამინ` before `კრეატინ`)
-  - **Option C:** Use fuzzy matching on user intent, not response content
-
-- **Status:** 🟡 IDENTIFIED - Fix pending
-
----
-
-## Evals Results (Latest - January 20, 2026)
-
-### With thinking_level=MEDIUM, thinking_budget=8192
-
-| Set | Pass | Fail | Rate | Avg Score |
-|-----|------|------|------|-----------|
-| Simple | 5 | 0 | 100% | 1.00 |
-| Context | 5 | 0 | 100% | 0.94 |
-| Medical | 5 | 0 | 100% | 0.96 |
-| Ethics | 5 | 0 | 100% | 0.94 |
-| Logic | 5 | 0 | 100% | 1.00 |
-| **TOTAL** | **25** | **0** | **100%** | **0.97** |
-
-**Improvement from previous session:** 92% (23/25) → 100% (25/25)
-
----
-
-*Last Updated: January 20, 2026 ~02:00*
-
----
-
-## Development Timeline: January 20, 2026 (Evening Session ~22:00-23:10)
-
-### Session: TIP Display Bug Fixes + Force Break Enhancement
-
-**Problem Reported:** 
-1. Raw `[TIP]...[/TIP]` tags appearing in UI alongside styled tip box (duplication)
-2. System instability - sometimes annotations, sometimes just product cards
-
----
-
-## Bug Log (January 20 - Evening Session)
-
-### Bug #19: Raw TIP Tags in Frontend (Initial)
-- **Symptom:** `[TIP] content [/TIP]` appearing as raw text in chat
-- **Root Cause:** Backend sending clean tip content, but frontend not wrapping properly
-- **Fix:** Frontend re-wraps tip content with `[TIP]` tags for parser
-- **Status:** ✅ RESOLVED
-
-### Bug #20: TIP Handler Stripping Tags Immediately
-- **Symptom:** TIP not displaying even when received via 'tip' event
-- **Root Cause:** `Chat.tsx` L505 was stripping `[TIP]` tags immediately after adding them
-- **Fix:** Removed `.replace(/\[TIP\][\s\S]*?\[\/TIP\]/g, '')` from tip event handler
-- **Location:** `frontend/src/components/Chat.tsx` L505
-- **Status:** ✅ RESOLVED
-
-### Bug #21: Inconsistent TIP Display - Multiple Code Paths (CRITICAL)
-- **Symptom:** TIP sometimes displays, sometimes duplicated, sometimes missing
-- **Root Cause Analysis:**
-  1. **Main text path:** Gemini generates native `[TIP]` in stream
-  2. **Option D path:** Uses thought content which may contain `[TIP]`
-  3. **Force break path:** Was using minimal fallback, missing TIP entirely
-  4. **Post-loop path:** May extract TIP but state not shared
-  
-- **Discovery Process (Deep Research):**
-  1. Found GitHub Issue #4090: Gemini 3 + Streaming + Tools = empty responses (confirmed SDK bug)
-  2. Backend logs showed `texts=0` when Force Break triggered
-  3. Signature loss on parallel function calls (only first has signature)
-  
-- **Full Fix (Claude Code Implementation):**
-  1. Created helper function `extract_tip_from_text()` at L744-767
-  2. Refactored all 4 TIP extraction paths to use helper
-  3. Enhanced Force Break path to use Option D logic instead of minimal fallback
-  4. Added `native_tip_sent` flag to prevent duplicate contextual tips
-
-- **Locations Modified:**
-  | Path | Location | Change |
-  |------|----------|--------|
-  | Helper function | L744-767 | New `extract_tip_from_text()` |
-  | Main text | L2260 | Uses helper |
-  | Option D in-loop | L2289 | Uses helper |
-  | Force break | L2444 | **NEW** - Uses Option D + helper |
-  | Post-loop | L2481 | Uses helper |
-  | Frontend | Chat.tsx L471, L489, L537 | Removed TIP stripping |
-
-- **Status:** ✅ RESOLVED
-
----
-
-## Deep Research Findings
-
-### GitHub Issue #4090: Gemini 3 + Streaming + Tools Bug
-**Source:** https://github.com/google/adk-python/issues/4090
-
-> When using `gemini-3-flash-preview` with **tools enabled** and **streaming=True**, 
-> the LLM response is consistently **empty/blank**.
-
-**Workaround Applied:** Option D - use collected thoughts as fallback when `texts=0`
-
-### Thought Signatures Critical for Multi-Turn
-Gemini 3 uses encrypted thought signatures to preserve reasoning context.
-- Only first function call in batch has signature
-- Second call fails silently
-
-**Workaround Applied:** Execute only first `search_products` call per batch
 
 ---
 
 ## Key Code Changes (Evening Session)
 
-| Location | Change |
-|----------|--------|
-| `main.py` L744-767 | New `extract_tip_from_text()` helper function |
-| `main.py` L2260 | Main text TIP extraction using helper |
-| `main.py` L2289 | Option D TIP extraction using helper |
-| `main.py` L2431-2470 | **Force break enhanced with Option D logic** |
-| `main.py` L2474-2495 | Post-loop TIP extraction using helper |
-| `Chat.tsx` L471, L489, L537 | Removed TIP stripping from text/products/error handlers |
+| Location | Change | Impact |
+|----------|--------|--------|
+| `main.py` L2469 | Send clean `tip` content (no tags) | Clean API contract |
+| `Chat.tsx` L491-494 | Wrap incoming tip with `[TIP]` tags | Parser compatibility |
 
 ---
 
-## System Architecture (Final - Bug #21 Fixed)
+## Verification
+
+- **Browser Test:** ✅ "პრაქტიკული რჩევა" styled box renders correctly
+- **No Raw Tags:** ✅ `[TIP]` and `[/TIP]` not visible to users
+- **Parser Working:** ✅ `parseProductsFromMarkdown` extracts tip successfully
+
+---
+
+## Development Timeline: January 20, 2026 (Night Session ~20:30-21:00)
+
+### Session: Cross-Chunk TIP Tag Streaming Fix
+
+**Problem Reported:** Despite Bug #18 fix, raw `[TIP]...[/TIP]` tags still appearing in frontend chat interface.
+
+---
+
+## Bug Log (January 20 - Night Session)
+
+### Bug #19: Cross-Chunk TIP Tag Display (STREAMING EDGE CASE)
+- **Symptom:** Raw `[TIP]` tags visible alongside rendered "პრაქტიკული რჩევა" box (duplication)
+- **Initial Assumption:** Bug #18 fix incomplete
+- **Deep Investigation:**
+  1. **Backend Analysis (`main.py` L2466-2472):**
+     - When Gemini natively generates `[TIP]` tags, backend sends raw tags via `text` event
+     - When backend adds tags, sends clean content via `tip` event
+  2. **Frontend Analysis (`Chat.tsx`):**
+     - Initial fix attempted to strip tags from incoming text chunks (L457-461)
+     - Regex: `/\[TIP\][\s\S]*?\[\/TIP\]/g`
+  3. **Root Cause Discovery (via Sequential Thinking):**
+     - SSE streaming sends data in **chunks**
+     - `[TIP]` can arrive in one chunk, content in next, `[/TIP]` in third
+     - **Regex cannot match split tags** → tags pass through to display
+- **Fix Strategy:** Strip tags at **message assignment time**, not chunk reception
+- **Implementation:**
+  - Applied regex replacement when setting `assistantContent` to message state
+  - Covered ALL event handlers: `text`, `products`, `tip`, `error`
+- **Locations Modified:**
+  | Location | Handler |
+  |----------|---------|
+  | `Chat.tsx` L470 | `text` event |
+  | `Chat.tsx` L487 | `products` event |
+  | `Chat.tsx` L505 | `tip` event |
+  | `Chat.tsx` L534 | `error` event |
+- **Status:** ✅ RESOLVED
+
+---
+
+## Key Code Changes (Night Session)
+
+| Location | Change | Impact |
+|----------|--------|--------|
+| `Chat.tsx` L470 | Strip `[TIP]` tags at text event message assignment | Removes native Gemini tags |
+| `Chat.tsx` L487 | Strip `[TIP]` tags at products event message assignment | Consistent cleanup |
+| `Chat.tsx` L505 | Strip `[TIP]` tags at tip event message assignment | No raw tags in tip display |
+| `Chat.tsx` L534 | Strip `[TIP]` tags at error event message assignment | Complete coverage |
+
+---
+
+## Technical Pattern: Cross-Chunk Regex Limitation
 
 ```
-User Query → /chat/stream
-     ↓
-Gemini Stream (may return texts=0 due to SDK bug #4090)
-     ↓
-[texts > 0?] ───YES───→ extract_tip_from_text(accumulated_text)
-     │                       → Send clean text via 'text' event
-     │                       → Send TIP via 'tip' event
-     │
-     └──NO──→ [Force Break or Option D]
-                   ↓
-              Check thought_texts_collected
-                   ↓
-              [has thoughts?]
-                   ├── YES → extract_tip_from_text(best_thought[:800])
-                   │         → Send clean text via 'text' event
-                   │         → Send TIP via 'tip' event
-                   │         → Set native_tip_sent = True
-                   └── NO  → Minimal fallback "აი შენთვის..."
-     ↓
-Post-Processing:
-├── if not native_tip_sent → generate_contextual_tip()
-├── Product formatting
-└── Quick replies parsing
-     ↓
-Frontend receives:
-├── 'text' event: Clean Georgian explanation
-├── 'tip' event: Clean tip content
-└── parseProducts.ts → Styled tip box renders ONCE ✅
+❌ WRONG: Strip during chunk arrival
+   Chunk 1: "გამარჯობა [TIP"    → regex no match
+   Chunk 2: "]რჩევა[/TIP]"      → regex no match
+   Result: Raw tags displayed
+
+✅ CORRECT: Strip at final message assignment
+   Accumulated: "გამარჯობა [TIP]რჩევა[/TIP]"
+   Regex match: Full tag found
+   Result: Clean content displayed
 ```
 
 ---
 
-## Debug Commands
+## Learnings From This Session
 
-```bash
-# Watch Force Break behavior
-tail -f backend.log | grep "Force break"
-
-# Watch TIP extraction
-tail -f backend.log | grep -E "TIP|tip"
-
-# Check texts vs thoughts ratio
-tail -f backend.log | grep "texts="
-```
+1. **SSE Streaming Chunking:** Tags can be split across network chunks - can't rely on per-chunk regex matching.
+2. **Buffer-Level Processing:** For SSE streams, apply transformations to accumulated content, not individual chunks.
+3. **Complete Handler Coverage:** When fixing SSE logic, ensure ALL event handlers are updated consistently.
 
 ---
 
-## Remaining Known Issues
+## Development Timeline: January 20, 2026 (Late Night Session ~22:20)
 
-### Issue #1: Gemini Non-Determinism (SDK Bug)
-- **Symptom:** Sometimes `texts=42`, sometimes `texts=0`
-- **Cause:** GitHub Issue #4090 - Gemini 3 + Streaming + Tools
-- **Workaround:** Option D fallback using thoughts
-- **Status:** 🟢 MITIGATED (not fixable - SDK bug)
+### Session: TIP Tag Display Fix (Bug #20)
 
-### Issue #2: Signature Loss on Parallel Calls
-- **Symptom:** Second function call missing signature
-- **Cause:** Gemini returns signature only on first call
-- **Workaround:** Execute only first call per batch
-- **Status:** 🟢 MITIGATED
+**Problem Reported:** TIP section not appearing in UI despite Gemini generating it correctly.
 
 ---
 
-*Last Updated: January 20, 2026 ~23:10*
+## Bug Log (January 20 - Late Night)
+
+### Bug #20: TIP Tags Stripped by Overly Aggressive Regex (FRONTEND LOGIC ERROR)
+- **Symptom:** TIP box not displaying in UI, but backend logs show `[TIP]...[/TIP]` generated
+- **Investigation Method:** `/debug` workflow - Light DRP
+- **Evidence Collection:**
+  1. Backend logs confirmed: `[TIP]საკვების აწონვა...[/TIP]` generated correctly ✅
+  2. Frontend `Chat.tsx` analysis: Bug #19 fix too aggressive
+- **Root Cause Discovery:**
+  - Bug #19 fix added `.replace(/\[TIP\][\s\S]*?\[\/TIP\]/g, '')` to ALL event handlers
+  - This included the `tip` event handler at L505
+  - **Result:** Handler added TIP tags, then immediately stripped them!
+  ```typescript
+  // BUG: tip handler was stripping its own tags
+  const tipWithTags = `\n\n[TIP]\n${data.content}\n[/TIP]`;
+  assistantContent += tipWithTags;  // ← Added TIP ✅
+  setConversations(...{ 
+    content: assistantContent.replace(/\[TIP\]...\[\/TIP\]/g, '') // ← Removed TIP ❌
+  });
+  ```
+- **Fix:** Remove `.replace()` from `tip` event handler only
+  - `text` event: Keep stripping (prevents Gemini native tag dupe)
+  - `products` event: Keep stripping
+  - `tip` event: **Remove stripping** (we intentionally add tags here)
+  - `error` event: Keep stripping
+- **Location:** `Chat.tsx` L505
+- **Status:** ✅ RESOLVED
 
 ---
 
-## Development Timeline: January 21, 2026 (~00:30-03:45)
+## Key Code Changes (Late Night Session)
 
-### Session: Query Orchestration Layer v1.0 + Evals Debugging
-
-**Goal:** Implement intelligent query analysis layer to handle complex queries with constraints, myths, and unrealistic goals.
+| Location | Change | Impact |
+|----------|--------|--------|
+| `Chat.tsx` L505 | Removed `.replace()` from tip handler | TIP tags preserved |
 
 ---
 
-## Feature: Query Orchestration Layer v1.0
+## Learnings From This Session
 
-### Architecture
+1. **Over-Correction Hazard:** Bug fixes that apply blanket patterns (e.g., strip everywhere) can break intentional behavior elsewhere.
+2. **Event Handler Isolation:** Each SSE event type has distinct purposes - `tip` event should preserve tags, `text` event should strip duplicates.
+3. **Quick Debug Path:** Backend logs → Frontend logic trace → targeted fix.
 
-```
-User Query → Query Analyzer → Constraint Search → Context Injector → Gemini
-     ↓              ↓                 ↓                  ↓
- "მინდა        budget=100        products=[              [ANALYSIS]
-  პროტეინი    dietary=['vegan']  {name, price}]         💰 ბიუჯეტი: 100₾
-  100 ლარში"  myths=[]            total=85₾              🧠 მითის გაცრუება: ...
-  vegan"      products=['protein'] status=OK            [/ANALYSIS]
-```
+---
 
-### Components Created
+*Last Updated: January 20, 2026 ~22:20*
 
-| File | Purpose |
-|------|---------|
-| `app/reasoning/query_analyzer.py` | Extracts constraints, detects myths, identifies unrealistic goals |
-| `app/reasoning/constraint_search.py` | Searches products with budget/dietary constraints |
-| `app/reasoning/context_injector.py` | Injects [ANALYSIS] block into enhanced message |
+---
 
-### Patterns Implemented
+## Development Timeline: January 21, 2026 (Night Session ~00:30-01:10)
 
-**MYTH_PATTERNS** (in `query_analyzer.py`):
-- `soy_estrogen`: სოიო/ესტროგენის მითი
-- `creatine_pills`: კრეატინის აბების მითი
-- `meal_replacement`: პროტეინი-საჭმელის ჩანაცვლება
+### Session: Hybrid Fallback Fix v5.1 (Empty Follow-up Response)
 
-**UNREALISTIC_PATTERNS**:
-- `rapid_muscle`: 10კგ კუნთი 1 თვეში
-- `impossible_price`: 100% ცილა 20 ლარად
-- `rapid_weight_loss`: 10კგ დაკლება 1 კვირაში
+**Problem Reported:** Follow-up queries returning fallback text `"აი შენთვის შესაფერისი პროდუქტები:"` instead of rich Georgian recommendations, despite products being found.
 
 ---
 
 ## Bug Log (January 21)
 
-### Bug #22: Evals Client Using Wrong Endpoint
-- **Symptom:** C2, M3, E4, L2 tests failing despite orchestration fix
-- **Discovery:** `evals/client.py` calls `/chat` endpoint, not `/chat/stream`
-- **Root Cause:** Query Orchestration Layer was only in `/chat/stream`
-- **Fix:** Integrated orchestration layer into `/chat` endpoint
-- **Location:** `main.py` L1990-2050
+### Bug #21: Empty Round Detection + Force Text Generation (CRITICAL)
+- **Symptom:** Follow-up queries like "კუნთის ზრდისთვის რა არის საუკეთესო?" returned fallback instead of detailed recommendations
+- **Investigation Method:** `/opus-planning` + `/debug` workflows with curl testing
+- **Evidence Collection:**
+  1. Backend logs: `Round 2: 1.14s, thoughts=0, texts=0, fc=0` → Empty round
+  2. Products found: `10 products` via `search_products`
+  3. History size: `79-84 messages` causing Gemini context confusion
+- **Root Cause Discovery (via Tree of Thoughts):**
+  - **History Confusion:** Long conversation history (50+ messages) caused Gemini to believe products were "already provided"
+  - **Loop Exhaustion:** `max_function_rounds=2` meant loop ended while Gemini still processing
+- **Fix Strategy:** Hybrid Approach (v5.1)
+  1. **History Pruning:** `keep_count` reduced from 50 to 30 messages
+  2. **Force Text Generation:** Post-loop always tries one more API call before fallback
+- **Locations Modified:**
+  | Location | Change |
+  |----------|--------|
+  | `mongo_store.py` L543-544 | `keep_count = 50` → `keep_count = 30` |
+  | `main.py` L2340-2346 | In-loop Force Round detection |
+  | `main.py` L2565-2606 | Post-loop Force Text Generation (v5.1 - no counter limit) |
 - **Status:** ✅ RESOLVED
-
-### Bug #23: History Parsing AttributeError
-- **Symptom:** `AttributeError: 'NoneType' object has no attribute 'lower'`
-- **Root Cause:** `query_analyzer.py` using dict access on SDK's Pydantic objects (UserContent, ModelContent)
-- **Fix:** Added `getattr()` for role/parts access + None check for `part.text`
-- **Location:** `query_analyzer.py` L273-289
-- **Status:** ✅ RESOLVED
-
-### Issue #6: Session Isolation Problem (IDENTIFIED)
-- **Symptom:** E4 test logs show `budget=0.0`, `myths=['soy_estrogen']`, `unrealistic=['impossible_price']`
-- **Problem:** These values belong to OTHER tests (M3, L2), not E4
-- **Root Cause:** All evals use same `user_id="eval_runner"` - histories mixing
-- **Evidence Log:**
-  ```
-  budget=0.0, dietary=['vegan'], myths=['soy_estrogen'], 
-  unrealistic=['impossible_price', 'impossible_price']
-  ```
-- **Impact:** Tests contaminating each other's context
-- **Proposed Fix:** Unique `session_id` per test
-- **Status:** 🔴 NOT FIXED - Awaiting implementation
-
----
-
-## Evals Results (January 21 - After Orchestration Layer)
-
-### Full Suite Run (25 tests)
-
-| Set | Pass | Fail | Rate | Avg Score |
-|-----|------|------|------|-----------|
-| Simple | 1 | 4 | 20% | 0.36 |
-| Context | 3 | 2 | 60% | 0.68 |
-| Medical | 4 | 1 | 80% | 0.80 |
-| Ethics | 2 | 3 | 40% | 0.48 |
-| Logic | 1 | 4 | 20% | 0.34 |
-| **TOTAL** | **11** | **14** | **44%** | **0.53** |
-
-### Passing Tests:
-- M3 (Myth Debunking): **1.00** ✅
-- L2 (Unrealistic Goals): **1.00** ✅
-- S3, M1, C3, C5, M2, M5, E1, E5, C2: Various scores
-
-### Identified Issues:
-1. **AFC Tool returns same product ("Critical Plant Protein")** for many queries
-2. **Orchestration [ANALYSIS] block may confuse Gemini** - causing hallucinations
-3. **Budget=0.0 pollution** from session history mixing
-
----
-
-## MongoDB AFC Tool Analysis
-
-### Schema Check
-- **Total in-stock products:** 315
-- **Creatines under 100₾:** 3+ products (Supspace 48₾, & Co 60₾, etc.)
-- **"Critical Plant Protein":** 3 duplicates at 191₾
-
-### Tool Logic (user_tools.py)
-1. **Translation layer** ✅ Georgian→English working
-2. **$regex search** ✅ searches keywords, name, brand
-3. **max_price filter** ✅ `$lte` constraint applied
-4. **in_stock filter** ✅ filters correctly
-
-### Key Finding
-AFC tool working correctly. Issue is in **session isolation** and **Orchestration Layer output format**.
 
 ---
 
 ## Key Code Changes (January 21)
 
-| Location | Change |
-|----------|--------|
-| `app/reasoning/query_analyzer.py` | New file: Query analysis patterns |
-| `app/reasoning/constraint_search.py` | New file: Budget-constrained product search |
-| `app/reasoning/context_injector.py` | New file: [ANALYSIS] block injection |
-| `main.py` L1990-2050 | Orchestration layer in `/chat` endpoint |
-| `query_analyzer.py` L273-289 | History parsing fix for Pydantic objects |
+| Location | Change | Impact |
+|----------|--------|--------|
+| `mongo_store.py` L543-544 | History pruning 50→30 | Reduces context confusion |
+| `main.py` L2196-2197 | Added `force_round_count` variable | Track forced rounds |
+| `main.py` L2340-2346 | Force Round 3 in-loop detection | Continue loop if empty |
+| `main.py` L2565-2606 | Force Text Gen v5.1 (always try) | Final safety net |
 
 ---
 
-## Next Steps (Prioritized)
+## Test Results
 
-1. **Session Isolation Fix** - Unique session_id per eval test
-2. **Budget=0 Fix** - Ensure None is preserved, not converted to 0
-3. **[ANALYSIS] Format** - Test if Gemini handles block better without it
-4. **A/B Compare** - Run evals with/without orchestration layer
+| Query | Type | Chars | TIP | Quick Replies | Time |
+|-------|------|-------|-----|---------------|------|
+| პროტეინი | First | 1847 | ✅ | ✅ | 13.3s |
+| კუნთის ზრდისთვის? | Follow-up | 2278 | ✅ | ✅ | 21.5s |
 
----
-
-*Last Updated: January 21, 2026 ~03:45*
+**No more fallback! All responses are rich Georgian text with tips and quick replies.**
 
 ---
 
-## Development Timeline: January 21, 2026 (Evening Session)
+## Learnings From This Session
 
-### Vector Search Integration
-
-**Goal:** Improve eval pass rate from 44% to 70%+ by implementing semantic product search.
-
-### Implementation Details
-
-#### 1. Config Change ([config.py](file:///config.py#L87-92))
-```python
-embedding_model: str = Field(
-    default_factory=lambda: os.getenv("EMBEDDING_MODEL", "text-embedding-004")
-)
-```
-
-#### 2. Vector Search Function ([user_tools.py](file:///app/tools/user_tools.py#L264-385))
-New `vector_search_products()` function:
-- Uses Gemini `text-embedding-004` (768-dim embeddings)
-- MongoDB `$vectorSearch` with `vector_index` and `description_embedding`
-- Falls back to `$regex` if vector search fails
-
-#### 3. Integrated into `search_products()` ([user_tools.py](file:///app/tools/user_tools.py#L435-483))
-- Vector search runs FIRST (Phase 1)
-- `$regex` is fallback (Phase 2)
-- Query embedding via `genai.embed_content()`
-
-### Database Cleanup
-
-| Metric | Before | After |
-|--------|--------|-------|
-| Total Products | 315 | **209** |
-| Duplicates Removed | - | **106** |
-| "Critical Plant Protein" entries | 3 | 1 |
-
-### Eval Results Improvement
-
-| Set | Pass Rate | Avg Score |
-|-----|-----------|-----------|
-| Simple | 80% | 0.84 |
-| Context | 60% | 0.70 |
-| Medical | 40% | 0.52 |
-| Ethics | 40% | 0.60 |
-| Logic | 80% | 0.86 |
-| **TOTAL** | **60%** | **0.70** |
-
-**Improvement: 44% → 60% (+16%)**
-
-### Files Changed
-- `config.py` - Added `embedding_model` setting
-- `app/tools/user_tools.py` - Added `vector_search_products()`, integrated into `search_products()`
-- MongoDB `products` collection - Removed 106 duplicates
+1. **History Length Matters:** Gemini with 80+ messages loses focus. 30 messages (15 exchanges) is optimal.
+2. **Force Text Generation Pattern:** When loop exhausts, explicit Georgian prompt forces text synthesis.
+3. **Counter Limit Pitfall:** v5.0 had `force_round_count < 1` in Post-Loop which blocked after in-loop force. v5.1 removes limit.
+4. **Hybrid Approach:** Combining preventive (history pruning) + reactive (force generation) provides robust solution.
 
 ---
 
-## Outstanding Issues (10 Failed Tests)
-
-| Test | Issue |
-|------|-------|
-| S4 | Flavors not listed |
-| C2 | Budget (100₾) ignored |
-| C4 | Sugar-free filter missed |
-| M1 | SSRI interaction ignored |
-| M2 | Creatinine vs creatine confusion |
-| M4 | Keto diet incomplete |
-| E1 | Caffeine addiction ignored |
-| E3 | No clarifying questions |
-| E5 | Competitor comparison weak |
-| L3 | Double negation |
+*Last Updated: January 21, 2026 ~01:10*
 
 ---
 
-## Next Steps (for 70%+ target)
+## Development Timeline: January 21, 2026 (Late Night Session ~01:15-03:15)
 
-1. **Session Isolation** - Unique session_id per eval test
-2. **System Prompt Optimization** - Better Medical/Ethics handling
-3. **Budget Constraint Enforcement** - Ensure price filters are respected
+### Session: C3 Holistic System Debug + Claude Code Handoff
 
----
-
-*Last Updated: January 21, 2026 ~19:20*
+**Problem Reported:** Systemic failures on complex queries - budget constraints ignored, no prioritization, myths not debunked.
 
 ---
 
-## Development Timeline: January 21, 2026 (Night Session ~21:00)
+## C3 Deep Reasoning Protocol (DRP)
 
-### Phase 8: User Profile Enhancement - Complete Pipeline
+### Phase 0-3: Sequential Thinking Analysis
 
-**Goal:** Implement full cycle: Extract user data from messages → Store in DB → Inject into LLM context
+**Symptoms Identified:**
+1. Budget queries (150₾) → Products 191₾, 220₾ shown
+2. Prioritization requests → Generic list, no ranking
+3. Myth debunking → Not addressed
+4. Multi-constraint (lactose + budget + 3 products) → All ignored
 
----
+**Root Cause (via 5-Thought Sequential Analysis):**
+- `system_prompt_lean.py` v3.0 lacks reasoning intelligence
+- `search_products(max_price)` EXISTS and WORKS ✅
+- `chat_stream` pipeline is STABLE ✅
+- **Problem:** Prompt has no instructions to USE max_price
 
-### Implementation Details
+### What v3.0 Has vs Lacks
 
-#### 1. ProfileExtractor ([app/profile/profile_extractor.py](file:///app/profile/profile_extractor.py))
-- RegEx-based extraction for Georgian text
-- Extracts: age, weight, height, occupation, semantic facts
-- Returns `ExtractionResult` dataclass
-
-#### 2. Profile Processor Middleware ([app/profile/profile_processor.py](file:///app/profile/profile_processor.py))
-- Non-blocking async wrapper
-- Graceful error handling (chat continues if extraction fails)
-- Updates `UserStore` with demographics and physical stats
-
-#### 3. Context Injection ([app/reasoning/context_injector.py](file:///app/reasoning/context_injector.py))
-- Added `_build_profile_block()` helper
-- Added `user_profile` parameter to `inject_context()`
-- Injects `[USER_PROFILE]` block before `[ANALYSIS]` block
-
-#### 4. Endpoint Integration ([main.py](file:///main.py))
-- `/chat` (L1967, L2019): Profile extraction + context injection
-- `/chat/stream` (L2225, L2291): Same integration
+| Has ✅ | Lacks ❌ |
+|--------|----------|
+| Safety rules | Budget logic |
+| Allergies | Prioritization |
+| Search syntax | Myth debunking |
+| Response format | Cart composition |
 
 ---
 
-### Output Format
-```
-[USER_PROFILE]
-👤 ასაკი: 30 წ
-⚖️ წონა: 85 კგ
-📏 სიმაღლე: 180 სმ
-💼 საქმიანობა: sedentary
-[/USER_PROFILE]
+## Proposed Fix: v3.1 (+360 tokens)
 
-[ANALYSIS]
-💰 ბიუჯეტი: 150₾
-...
-```
+Add 4 sections after line 23 (after ალერგიები):
+
+1. **ბიუჯეტის ლოგიკა** - `search_products(max_price=X)`
+2. **პრიორიტიზაცია** - protein > creatine > omega-3
+3. **მითების გაქარწყლება** - "ქიმიაა" → factual response
+4. **კალათის კომპოზიცია** - calculate total, don't exceed
 
 ---
 
-### Test Results
+## Claude Code Handoff Created
 
-| Suite | Passed | XFail |
-|-------|--------|-------|
-| Profile Logic | 29 | 0 |
-| Safety Tests | 11 | 4 |
-| **Total** | **40** | **4** |
-
-**XFail:** Georgian negation patterns (e.g., "არ ვარ 20, 30-ის ვარ")
+**File:** `backend/CLAUDE_CODE_HANDOFF.md`
+- Contains failing queries, symptoms, key files to analyze
+- NO proposed solution - Claude Code to find root cause independently
+- Verification commands provided
 
 ---
 
-### Files Added/Modified
+## Next Steps
 
-| File | Type | Description |
-|------|------|-------------|
-| `app/profile/profile_extractor.py` | NEW | RegEx extraction |
-| `app/profile/profile_processor.py` | NEW | Async middleware |
-| `app/reasoning/context_injector.py` | MODIFY | Profile block injection |
-| `main.py` | MODIFY | Endpoint integration |
-| `tests/test_profile_enhancement.py` | NEW | 29 logic tests |
-| `tests/test_profile_safety.py` | NEW | 15 safety tests |
+1. Claude Code analyzes and implements fix
+2. Run evals: `C2`, `M3`, `E4`, `L2`
+3. Manual test failing queries
+4. Sync to GitHub after verification
 
 ---
 
-### Data Flow Architecture
-```
-Message → ProfileExtractor → UserStore (MongoDB)
-             ↓
-get_user() → inject_context() → [USER_PROFILE] → Gemini
-```
-
----
-
-### Deferred
-
-- [x] ~~`verify_fact_with_llm()` - LLM verification for negation patterns~~ ✅ COMPLETED (Phase 9)
-- [ ] Voyage AI embeddings for semantic facts
-
----
-
-*Last Updated: January 21, 2026 ~22:40*
+*Last Updated: January 21, 2026 ~22:45*
 
 ---
 
@@ -1281,419 +925,180 @@ get_user() → inject_context() → [USER_PROFILE] → Gemini
 
 ### Phase 9: LLM Fact Verification (Guard Layer)
 
-**Goal:** Implement LLM-based verification for ambiguous extractions (negation, context reference, conflicting facts).
+**Goal:** Implement smart extraction with negation and context reference handling.
 
 ---
 
-## Implementation Log (January 21 - Evening Session)
+## Features Implemented
 
-### Feature #1: LLM Fact Verification
-- **Purpose:** When RegEx extracts a value but context is ambiguous (negation, other person), use LLM to verify
-- **Implementation:**
-  - Added `verify_fact_with_llm()` async function in `profile_extractor.py`
-  - Uses Gemini Flash with `gemini-2.0-flash` model
-  - Returns: verified value, corrected value, or `None` (reject extraction)
-- **Location:** `app/profile/profile_extractor.py` L369-450
-- **Status:** ✅ IMPLEMENTED
+### 1. Smart Negation Fallback (Zero Latency)
+- `"90 კილო კი არ ვარ, 85 კილო ვარ"` → Saves **85** (last value)
+- No LLM call needed, instant processing
+- Location: `app/profile/profile_extractor.py` L201-228
 
-### Feature #2: Negation Detection
-- **Purpose:** Detect Georgian negation patterns like "90 კილო კი არ ვარ, 85 კილო ვარ"
-- **Implementation:**
-  - Added `has_negation()` function with `NEGATION_TRIGGERS` list
-  - Triggers: `არ ვარ`, `კი არა`, `აღარ`, `არა ვარ`
-- **Location:** `app/profile/profile_extractor.py` L337-350
-- **Status:** ✅ IMPLEMENTED
+### 2. Context Reference Detection
+- `"შვილს 14 წელი აქვს"` → **Skips extraction** (not user's data)
+- Triggers: `შვილ`, `ძმა`, `მშობ`, `მეგობ`, `ცოლ`, `ქმარ`
+- Location: `app/profile/profile_extractor.py` L353-366
 
-### Feature #3: Context Reference Detection
-- **Purpose:** Skip extraction when user talks about someone else (child, sibling, etc.)
-- **Implementation:**
-  - Added `has_context_reference()` function with `CONTEXT_TRIGGERS` list
-  - Triggers: `შვილ`, `ძმა`, `და`, `მშობ`, `მეგობ`, `ცოლ`, `ქმარ`, `დედა`, `მამა`
-- **Location:** `app/profile/profile_extractor.py` L353-366
-- **Status:** ✅ IMPLEMENTED
+### 3. LLM Fact Verification
+- Async verification for truly ambiguous cases
+- Uses Gemini Flash for quick confirmation
+- Location: `app/profile/profile_extractor.py` L369-450
 
-### Feature #4: Smart Negation Fallback (Zero Latency)
-- **Problem:** LLM verification timeout (0.5s) caused fallback to first RegEx match (wrong value)
-- **Solution:** Modified `_extract_weight()` to use LAST number when negation detected
-  - `"90 კილო კი არ ვარ, 85 კილო ვარ"` → Returns **85** (not 90)
-- **Benefit:** No LLM call needed, zero added latency
-- **Location:** `app/profile/profile_extractor.py` L201-228
-- **Status:** ✅ IMPLEMENTED
-
-### Feature #5: Physical Stats in get_user_profile()
-- **Problem:** `get_user_profile()` didn't return weight for Context Injection
-- **Fix:** Added `physical_stats` extraction from `weight_history`
-  ```python
-  "physical_stats": {
-      "weight": current_weight,  # From weight_history[-1]
-      "height": physical_stats.get("height"),
-      "age": demographics.get("age")
-  }
-  ```
-- **Location:** `app/tools/user_tools.py` L162-190
-- **Status:** ✅ IMPLEMENTED
+### 4. Physical Stats in Profile Response
+- `get_user_profile()` now returns `weight`, `height`, `age`
+- Enables Context Injection with user's physical data
+- Location: `app/tools/user_tools.py` L162-190
 
 ---
 
-## Key Code Changes (Phase 9)
+## Code Changes Summary
 
-| File | Change |
-|------|--------|
-| `app/profile/profile_extractor.py` | +168 lines: verify_fact_with_llm, has_negation, has_context_reference, smart extraction |
-| `app/profile/profile_processor.py` | +102 lines: async processing with verification triggers |
-| `app/tools/user_tools.py` | +31 lines: physical_stats in profile response |
-| `main.py` | +43 lines: profile processing integration |
-| `tests/test_profile_safety.py` | +112 lines: 10 green tests for new features |
-
----
-
-## Test Results (Phase 9)
-
-| Test Suite | Tests | Status |
-|------------|-------|--------|
-| `test_profile_safety.py` | 10 | ✅ All Green (1.44s) |
-| LLM Verification | 2 | ✅ Async timeout handling |
-| Negation Detection | 3 | ✅ Georgian patterns |
-| Context Reference | 3 | ✅ Skip extraction |
-| Smart Fallback | 2 | ✅ Last-value selection |
+| File | Changes |
+|------|---------|
+| `app/profile/profile_extractor.py` | +168 lines |
+| `app/profile/profile_processor.py` | +102 lines |
+| `app/tools/user_tools.py` | +31 lines |
+| `tests/test_profile_safety.py` | +112 lines |
+| **Total** | +511 lines |
 
 ---
 
 ## E2E Test Results
 
-| Step | Feature | Result |
-|------|---------|--------|
-| 1. Context Trap | "შვილს 14 წ აქვს" → Skip | ✅ **PASSED** |
-| 2. Negation Fix | "90 კი არა, 85 ვარ" → 85 saved | ✅ **PASSED** |
-| 3. Context Injection | Weight 85kg in profile response | ✅ **PASSED** |
+| Test | Input | Expected | Result |
+|------|-------|----------|--------|
+| Context Trap | "შვილს 14 წ აქვს" | Skip extraction | ✅ PASSED |
+| Negation Fix | "90 კი არა, 85 ვარ" | Save 85kg | ✅ PASSED |
+| Context Injection | Protein query | Show weight in profile | ✅ PASSED |
 
 ---
 
-## Data Flow (Phase 9)
+## GitHub Sync
 
-```
-User Message → ProfileProcessor
-       ↓
-RegEx Extraction (age/weight/height)
-       ↓
-[Context Reference?] → SKIP extraction
-       ↓
-[Negation Detected?] → Smart Fallback (use LAST value)
-       ↓
-[Still Ambiguous?] → verify_fact_with_llm() (optional)
-       ↓
-MongoDB Update → users collection
-       ↓
-get_user_profile() → physical_stats → Context Injection
-       ↓
-[USER_PROFILE] block in Gemini prompt
-```
+| Repo | Status |
+|------|--------|
+| Backend | ✅ Pushed (0069298) |
+| Frontend | No changes |
 
 ---
 
-## Performance Impact
+## Development Timeline: January 22, 2026 (Afternoon Session ~16:00-17:20)
 
-| Metric | Before | After |
-|--------|--------|-------|
-| Negation handling | ❌ Wrong value | ✅ Correct value |
-| Context reference | ❌ Wrong extraction | ✅ Skipped |
-| Added latency | N/A | **0ms** (smart fallback) |
-| LLM calls | 0 | ~0.5/request (only when needed) |
+### Session: v2.0 Engine Bug Fixes
+
+**Goal:** Fix v2.0 Engine bugs blocking frontend display.
 
 ---
 
-# Phase 10: Latin Transliteration & Occupation Enhancement (2026-01-21/22)
+## Bug Log (January 22)
 
-## Overview
+### Bug #22: SDK ValueError in Function Response (CRITICAL)
+- **Symptom:** `ValueError: Message must be a valid part type` on Round 2
+- **Root Cause:** `_build_function_response_message` returned dicts, SDK requires `Part` objects
+- **Fix:** `Part.from_function_response()` in `app/core/function_loop.py` L433-458
+- **Status:** ✅ RESOLVED
 
-Enhanced profile extraction to support Latin script input and improved occupation detection with negation awareness.
-
----
-
-## Feature 1: Latin-to-Georgian Transliteration
-
-### Problem
-Users typing in Latin script (e.g., "50 wlis var", "85 kg viwoni") were not having their profile data extracted because RegEx patterns were designed for Georgian Unicode characters.
-
-### Solution
-Added a preprocessing step that converts common Latin phonetic spellings to Georgian equivalents before pattern matching.
-
-### Implementation
-
-**File:** `app/profile/profile_extractor.py`
-
-```python
-LATIN_TO_GEORGIAN = {
-    # Age-related
-    "wlis": "წლის",
-    "weli": "წელი",
-    "welia": "წელია",
-    
-    # Weight-related  
-    "kg": "კგ",
-    "kilogrami": "კილოგრამი",
-    "viwoni": "ვიწონი",
-    
-    # Common verbs
-    "var": "ვარ",
-    "viyavi": "ვიყავი",
-    "vmushaoб": "ვმუშაობ",
-    
-    # Occupations
-    "programisti": "პროგრამისტი",
-    "developeri": "დეველოპერი",
-    # ... (full list in source)
-}
-
-def apply_transliteration(text: str) -> str:
-    result = text.lower()
-    for latin, georgian in sorted(LATIN_TO_GEORGIAN.items(), key=lambda x: -len(x[0])):
-        result = result.replace(latin, georgian)
-    return result
-```
-
-### Data Flow
-
-```
-User Input: "50 wlis var"
-       ↓
-apply_transliteration()
-       ↓
-Processed: "50 წლის ვარ"
-       ↓
-RegEx Pattern Match → age: 50
-       ↓
-MongoDB Update
-```
+### Bug #23: Frontend Empty Response Display (CRITICAL)
+- **Symptom:** Thinking steps show, but text response empty in UI
+- **Root Cause:** Backend sent `data: {"content": "..."}`, frontend expected `data.type === 'text'`
+- **Fix:** Include `type` in SSE payload: `{"type": "text", "content": "..."}`
+- **Location:** `app/core/engine.py` L67-76
+- **Status:** ✅ RESOLVED
 
 ---
 
-## Feature 2: Negation-Aware Occupation Extraction
+## Key Code Changes (January 22)
 
-### Problem
-Simple keyword matching caused incorrect occupation extraction:
-- "პროგრამისტი ვიყავი, ახლა მზარეული ვარ" → Extracted "პროგრამისტი" (wrong)
-- "ვმუშაობ" matched "მუშა" keyword → Extracted "მუშა" (false positive)
-
-### Solution: "Negation-Aware Last Match Wins" Algorithm
-
-1. Collect ALL occupation candidates from the message
-2. Check each candidate for nearby negation words
-3. Skip negated candidates
-4. Select the LAST non-negated candidate
-
-### Negation Triggers
-
-```python
-NEGATION_WORDS = [
-    "აღარ",      # no longer
-    "დავკარგე",  # I lost
-    "ვიყავი",    # I was (past)
-    "ადრე",      # before/previously
-    "წავედი",    # I left
-    "გავედი",    # I quit
-    "დავანებე",  # I gave up
-]
-```
-
-### Occupation Keywords Updated
-
-| Category | Added | Removed |
-|----------|-------|---------|
-| `sedentary` | `it-`, `აითი`, `დეველოპერ`, `ინჟინერ` | - |
-| `light` | `მზარეულ`, `შეფ`, `მცხობელ` | - |
-| `heavy` | - | `მუშა` (false positive prevention) |
+| Location | Change |
+|----------|--------|
+| `app/core/function_loop.py` L28 | Added `from google.genai.types import Part` |
+| `app/core/function_loop.py` L433-458 | Return `List[Part]` with `Part.from_function_response()` |
+| `app/core/engine.py` L67-76 | SSE payload includes `type` field for frontend |
 
 ---
 
-## Test Results (Phase 10)
-
-| Test Suite | Tests | Status |
-|------------|-------|--------|
-| `test_profile_enhancement.py` | 34 | ✅ All Green |
-| `test_profile_safety.py` | 17 | ✅ All Green |
-| Occupation Negation Tests | 9 | ✅ All Green |
-| Latin Transliteration | Ad-hoc | ✅ Verified |
-
-### New Test Cases Added
-
-```python
-# test_profile_enhancement.py
-def test_occupation_negation_viyavi()  # ვიყავი triggers negation
-def test_occupation_single_candidate()  # Single match works
-def test_occupation_last_wins()         # Last non-negated wins
-def test_occupation_negation_davkarbe() # დავკარგე triggers negation
-def test_occupation_negation_aghar()    # აღარ triggers negation
-def test_occupation_negation_adre()     # ადრე triggers negation
-```
+*Last Updated: January 22, 2026 ~17:20*
 
 ---
 
-## Bug Fixes
+## Development Timeline: January 22, 2026 (Late Evening Session ~19:40-21:03)
 
-### Bug #57: Age Not Persisted (Resolved)
-- **Symptom:** User said "35 წლის ვარ" but age wasn't saved
-- **Root Cause:** `user_id` mismatch between browser sessions (frontend reload generated new widget ID)
-- **Resolution:** Manual MongoDB update + identified need for persistent user sessions
+### Session: Holistic Stability Fix - Session Amnesia, NoneType Crash, Function Loop
 
-### Bug #58: Latin Script Not Extracted (Resolved)
-- **Symptom:** "50 wlis var" didn't extract age
-- **Root Cause:** RegEx patterns only matched Georgian Unicode
-- **Resolution:** Implemented `apply_transliteration()` preprocessing
+**Problems Reported:**
+1. Every message started with "გამარჯობა" - model didn't remember history
+2. Follow-up questions always the same (after ~3rd question)
+3. Empty Response crashes
 
 ---
 
-## Files Modified
+## Bug Log (January 22 - Late Evening)
 
-| File | Changes |
-|------|---------|
-| `app/profile/profile_extractor.py` | +`LATIN_TO_GEORGIAN` map, +`apply_transliteration()`, Updated `_extract_occupation()` with negation logic, Updated occupation keywords |
-| `tests/test_profile_enhancement.py` | +6 new occupation negation tests |
+### Bug #24: Session Amnesia - Frontend/Backend Session ID Mismatch (CRITICAL)
+- **Symptom:** `history_len=0` on every request despite being in same conversation
+- **Evidence from logs:**
+  ```
+  📥 _load_context START: requested_session=6vqsrxk2aw8
+  📥 _load_context COMPLETE: session=session_15d7dd81a7c6, history_len=0
+  ```
+- **Root Cause Discovery:**
+  - Frontend sends `convId` (e.g., `6vqsrxk2aw8`) which is locally generated
+  - Backend creates NEW session `session_xxx` format
+  - MongoDB query with frontend's convId returns nothing
+  - Backend creates fresh session → history lost!
+- **Fix (Two-Part):**
+  1. **Backend (`engine.py` L421-426):** Return `session_id` in SSE `done` event
+  2. **Frontend (`Chat.tsx`):**
+     - Added `backendSessionId` to Conversation interface
+     - Store session_id from done event
+     - Use `backendSessionId` for subsequent requests
+- **Status:** ✅ RESOLVED
 
----
+### Bug #25: MAX_FUNCTION_CALLS Override in .env (CONFIG)
+- **Symptom:** Logs showed `Streaming round 1/3` despite config.py having `5`
+- **Root Cause:** `.env` file had `MAX_FUNCTION_CALLS=3` which overrode default
+- **Fix:** Changed `.env` to `MAX_FUNCTION_CALLS=5`
+- **Status:** ✅ RESOLVED
 
-## Development Timeline: January 22, 2026
-
-### Phase 4: v2.0 Validation & Cleanup
-
-**Goal:** Remove all legacy v1.0 code, making v2.0 ConversationEngine the sole implementation.
-
-### Changes Made
-
-#### 1. ContextVar Purge (`app/tools/user_tools.py`)
-- **Removed:** `_current_user_id: ContextVar[Optional[str]]`
-- **Updated:** All tool functions now accept explicit `user_id` parameter
-- **Why:** ContextVar failed with `asyncio.to_thread` (context lost in thread pool)
-- **Kept:** `_last_search_products` ContextVar (still needed for AFC product capture in `/chat`)
-
-**Before (v1.0):**
-```python
-_current_user_id: ContextVar[Optional[str]] = ContextVar('current_user_id', default=None)
-
-def get_user_profile() -> dict:
-    user_id = _current_user_id.get()  # Magic context lookup (fails in thread pool)
-```
-
-**After (v2.0):**
-```python
-def get_user_profile(user_id: str) -> dict:
-    """v2.0: Requires explicit user_id parameter (no ContextVar magic)."""
-    if not user_id:
-        return {"error": "user_id is required (v2.0 explicit parameter)"}
-```
-
-#### 2. Legacy Code Deletion (`main.py`)
-- **Deleted:** ~1,450 lines of legacy code
-- **Removed:** `chat_stream` function (~735 lines of v1.0 streaming)
-- **Removed:** Legacy `/chat` endpoint code (~190 lines)
-- **Removed:** `_current_user_id` import and usage
-- **Result:** `main.py` reduced from ~3,162 → ~1,710 lines
-
-#### 3. Feature Flag Removal (`config.py`)
-- **Changed:** `engine_version` from env-configurable to hardcoded `"v2"`
-- **Comment:** "v2.0 unified ConversationEngine is now the default and only implementation"
-
-#### 4. Endpoint Simplification
-
-**`/chat` endpoint (before):** ~200 lines with ContextVar.set(), manual FC handling
-**`/chat` endpoint (after):**
-```python
-@app.post("/chat", response_model=ChatResponse)
-async def chat(request: Request, chat_request: ChatRequest):
-    """Main chat endpoint using v2.0 ConversationEngine."""
-    return await _chat_v2(chat_request)
-```
-
-**`/chat/stream` endpoint (before):** ~800 lines with simulated thinking, Option D fallbacks
-**`/chat/stream` endpoint (after):**
-```python
-@app.post("/chat/stream")
-async def chat_stream(request: Request, stream_request: ChatRequest):
-    """SSE Streaming endpoint using v2.0 ConversationEngine."""
-    return await _chat_stream_v2(stream_request)
-```
-
-### Test Results
-
-| Metric | Value |
-|--------|-------|
-| Tests Passed | 186/186 |
-| Warnings | 33 (all `datetime.utcnow()` deprecation) |
-| Execution Time | 3.29s |
-
-### v2.0 Architecture Summary
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         main.py                                  │
-│  /chat ──────────────→ _chat_v2() ──────┐                       │
-│  /chat/stream ───────→ _chat_stream_v2() │                      │
-└────────────────────────────────────────┬─┘                      │
-                                         │                        │
-                                         ▼                        │
-┌─────────────────────────────────────────────────────────────────┐
-│                    ConversationEngine                            │
-│  ┌─────────────┐  ┌─────────────┐  ┌──────────────────┐        │
-│  │ FunctionLoop│  │ResponseBuffer│  │ ThinkingManager │        │
-│  │ (MFC only)  │  │ (dedup/tips)│  │ (SIMPLE_LOADER) │        │
-│  └──────┬──────┘  └─────────────┘  └──────────────────┘        │
-│         │                                                       │
-│         ▼                                                       │
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │                    ToolExecutor                              ││
-│  │  user_id: str  (explicit, no ContextVar)                    ││
-│  │  search_fn, profile_fn, update_profile_fn, product_fn       ││
-│  └──────────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Files Modified
-
-| File | Changes |
-|------|---------|
-| `app/tools/user_tools.py` | Removed `_current_user_id` ContextVar, added explicit `user_id` params |
-| `config.py` | Hardcoded `engine_version: str = "v2"` |
-| `main.py` | Deleted ~1,450 lines, simplified both endpoints |
+### Bug #26: NoneType Crash - candidate.content.parts is None (CRITICAL)
+- **Symptom:** `TypeError: 'NoneType' object is not iterable`
+- **Stack Trace:**
+  ```python
+  File "function_loop.py", line 635, in _execute_round_streaming
+    for part in candidate.content.parts:
+  TypeError: 'NoneType' object is not iterable
+  ```
+- **Root Cause:** Gemini returns response where `candidate.content.parts` is `None`
+- **Fix - 3 Locations (Defensive Null Checks):**
+  1. `function_loop.py` L307: Sync execution method
+  2. `function_loop.py` L635: Streaming execution method
+  3. `gemini_adapter.py` L522: Chunk parsing
+- **Status:** ✅ RESOLVED
 
 ---
 
-## Eval Suite Expectations
+## Key Code Changes (January 22 - Late Evening)
 
-### What the Eval Suite Validates
-
-The 186 tests cover:
-
-| Module | Test Count | Validates |
-|--------|------------|-----------|
-| `test_engine_integration.py` | 24 | ConversationEngine init, streaming, profile injection |
-| `test_function_loop.py` | 22 | MFC loop, retry logic, deduplication, timeouts |
-| `test_response_buffer.py` | 36 | Text ops, product dedup, tip extraction, quick replies |
-| `test_thinking_manager.py` | 38 | Strategies, events, native thought handling |
-| `test_profile_enhancement.py` | 49 | Georgian NLP extraction, demographics, facts |
-| `test_profile_safety.py` | 17 | Fail-safes, latency, negation, edge cases |
-
-### Key Test Scenarios
-
-1. **Engine Initialization:** Gemini client required, config defaults
-2. **Streaming:** SSE event format, yields events correctly
-3. **Function Loop:** Max rounds, retry on empty, deduplication
-4. **Response Buffer:** Thread-safe text append, product dedup by ID
-5. **Thinking Manager:** SIMPLE_LOADER strategy, function call events
-6. **Profile Extraction:** Georgian age/weight/occupation with negation
-7. **Safety:** Survives DB failures, extraction timeouts
-
-### Running Tests
-
-```bash
-# Full suite
-python3 -m pytest tests/ -v
-
-# Specific module
-python3 -m pytest tests/core/test_engine_integration.py -v
-
-# With coverage
-python3 -m pytest tests/ --cov=app --cov-report=term-missing
-```
+| Location | Change |
+|----------|--------|
+| `engine.py` L421-426 | Add `session_id` to SSE done event |
+| `Chat.tsx` interface | Add `backendSessionId` field |
+| `Chat.tsx` done handler | Store `data.session_id` |
+| `.env` | `MAX_FUNCTION_CALLS=5` |
+| `function_loop.py` L307, L635 | Defensive null checks |
+| `gemini_adapter.py` L522 | Defensive null check |
 
 ---
 
+## GitHub Sync (January 22 - Late Evening)
+
+| Repo | Commit | Status |
+|------|--------|--------|
+| Backend | `cb0e9f0` | ✅ Pushed |
+| Frontend | `c15e278` | ✅ Pushed |
+
+---
+
+*Last Updated: January 22, 2026 ~21:03*
