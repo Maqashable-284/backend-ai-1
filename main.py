@@ -1,0 +1,1710 @@
+"""
+Scoop GenAI - Google Gemini SDK Implementation
+==============================================
+
+Production-ready FastAPI server with:
+- Gemini 2.5 Flash integration
+- MongoDB persistence
+- SSE streaming
+- Automatic function calling
+- Comprehensive error handling
+
+ANSWERS TO ALL QUESTIONS:
+
+Question #4: Technical Implementation
+-------------------------------------
+- Async Support: send_message_async() is production-stable
+- Streaming: Use send_message(..., stream=True) or generate_content_async(stream=True)
+- Error Handling: See GEMINI_EXCEPTIONS below
+- Auto Function Calling: Model retries with different params if tool returns error
+
+Question #5: Production Considerations
+--------------------------------------
+- Cloud Run: Cold start ~2-3s (SDK import), use min_instances=1
+- Observability: Google Cloud Trace integration shown below
+- Rate Limits: 2000 RPM (paid), 15 RPM (free)
+- Retry: Exponential backoff on 429/503
+
+Question #6: Security
+---------------------
+- Prompt Injection: Use SafetySettings (shown below)
+- PII: MongoDB encryption at rest recommended
+"""
+import os
+import re
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+import uuid
+
+# Note: nest_asyncio removed due to uvloop conflict in Python 3.13
+# Async loop warnings in user_tools.py are non-critical - app continues to work
+
+# Prompt injection detection patterns (logging only, no blocking)
+SUSPICIOUS_PATTERNS = [
+    'ignore previous', 'forget instructions', 'disregard', 'override system',
+    'system prompt', 'ignore above', 'new instructions', 'you are now'
+]
+
+# FastAPI
+from fastapi import FastAPI, HTTPException, Request, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel, Field, field_validator
+
+# Google GenAI SDK (new unified SDK)
+from google import genai
+from google.genai import types
+from google.genai.types import (
+    GenerateContentConfig,
+    SafetySetting,
+    HarmCategory,
+    HarmBlockThreshold,
+    Part,
+    UserContent,
+    ModelContent,
+    ThinkingConfig,
+)
+
+# Local imports
+from config import settings, SYSTEM_PROMPT
+from app.memory.mongo_store import (
+    db_manager,
+    ConversationStore,
+    UserStore,
+)
+from app.catalog.loader import CatalogLoader
+from app.tools.user_tools import (
+    get_user_profile,
+    update_user_profile,
+    search_products,
+    get_product_details,
+    set_stores,
+    GEMINI_TOOLS,
+    get_last_search_products,  # AFC product capture (Bug fix)
+    clear_last_search_products,  # AFC product capture (Bug fix)
+)
+from app.profile.profile_processor import process_user_message
+
+# Week 4: Context Caching
+from app.cache.context_cache import ContextCacheManager, CacheRefreshTask
+
+# =============================================================================
+# v2.0 ENGINE (Now the ONLY implementation)
+# =============================================================================
+# v2.0 unified ConversationEngine replaces legacy chat_stream
+from app.core import (
+    ConversationEngine,
+    ConversationEngineConfig,
+    ResponseMode,
+    SSEEvent,
+    create_conversation_engine,
+)
+logger_v2 = logging.getLogger("scoop.engine.v2")
+logger_v2.info("🚀 v2.0 Engine initialized")
+
+# Rate Limiting
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+limiter = Limiter(key_func=get_remote_address)
+
+# =============================================================================
+# LOGGING & OBSERVABILITY
+# =============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# Question #5: Observability - Google Cloud Trace Integration
+# Uncomment for Cloud Run deployment:
+# from opentelemetry import trace
+# from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
+# from opentelemetry.sdk.trace import TracerProvider
+# from opentelemetry.sdk.trace.export import BatchSpanProcessor
+#
+# trace.set_tracer_provider(TracerProvider())
+# cloud_trace_exporter = CloudTraceSpanExporter()
+# trace.get_tracer_provider().add_span_processor(
+#     BatchSpanProcessor(cloud_trace_exporter)
+# )
+# tracer = trace.get_tracer(__name__)
+
+
+# =============================================================================
+# GEMINI CONFIGURATION (New SDK)
+# =============================================================================
+
+# Initialize Gemini client (new SDK uses client-based approach)
+# API key can be passed directly or via GEMINI_API_KEY env var
+gemini_client = genai.Client(api_key=settings.gemini_api_key)
+
+# Question #6: Security - Safety Settings (new format: list of SafetySetting objects)
+SAFETY_SETTINGS = [
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        threshold=HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_HARASSMENT,
+        threshold=HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+        threshold=HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+        threshold=HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    ),
+]
+
+# Generation config - now part of GenerateContentConfig in new SDK
+# Will be merged into chat config when creating sessions
+
+
+# =============================================================================
+# EXCEPTION HANDLING
+# =============================================================================
+
+"""
+ANSWER TO QUESTION #4: Error Handling - Gemini SDK Exceptions
+
+Common exceptions to catch:
+1. google.api_core.exceptions.ResourceExhausted (429) - Rate limit
+2. google.api_core.exceptions.ServiceUnavailable (503) - Service down
+3. google.api_core.exceptions.InvalidArgument (400) - Bad request
+4. google.generativeai.types.BlockedPromptException - Safety filter
+5. google.generativeai.types.StopCandidateException - Generation stopped
+"""
+
+RETRY_EXCEPTIONS = (
+    "ResourceExhausted",  # 429 - Rate limit
+    "ServiceUnavailable",  # 503 - Temporary outage
+    "DeadlineExceeded",  # Timeout
+)
+
+
+class GeminiTimeoutError(Exception):
+    """Raised when Gemini API call times out"""
+    pass
+
+
+async def call_with_retry(
+    func,
+    *args,
+    max_retries: int = 4,
+    base_delay: float = 2.0,
+    **kwargs
+):
+    """
+    ANSWER TO QUESTION #5: Retry Logic for 429 errors
+
+    Exponential backoff: 2s, 4s, 8s, 16s
+    Now wrapped with timeout for Gemini 3 compatibility.
+    """
+    last_exception = None
+
+    for attempt in range(max_retries):
+        try:
+            # Wrap with timeout for Gemini 3 compatibility
+            return await asyncio.wait_for(
+                func(*args, **kwargs),
+                timeout=settings.gemini_timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            raise GeminiTimeoutError(
+                f"Gemini API timed out after {settings.gemini_timeout_seconds}s"
+            )
+        except Exception as e:
+            error_type = type(e).__name__
+
+            if error_type in RETRY_EXCEPTIONS:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(
+                    f"Retry {attempt + 1}/{max_retries} after {error_type}, "
+                    f"waiting {delay}s"
+                )
+                await asyncio.sleep(delay)
+                last_exception = e
+            else:
+                raise
+
+    raise last_exception
+
+
+# =============================================================================
+# SESSION MANAGEMENT
+# =============================================================================
+
+@dataclass
+class Session:
+    """Chat session with Gemini model (new SDK)"""
+    user_id: str
+    session_id: str
+    chat: Any  # google.genai async chat session
+    history: list = field(default_factory=list)  # Track history for MongoDB
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    last_activity: datetime = field(default_factory=datetime.utcnow)
+
+    def update_activity(self):
+        self.last_activity = datetime.utcnow()
+
+
+class SessionManager:
+    """
+    Manages chat sessions per user (New SDK version)
+
+    ANSWER TO QUESTION #1: Multi-session Support
+
+    - Each user gets persistent session
+    - Sessions persist in MongoDB
+    - In-memory cache for active sessions
+    - TTL-based cleanup
+
+    New SDK Migration Notes:
+    - Uses client.aio.chats.create() for async chat sessions
+    - History format uses UserContent/ModelContent types
+    - Config includes system_instruction, tools, safety_settings
+
+    Week 4 Update:
+    - Supports context caching for 85% token savings
+    - When cache_manager provided, uses cached_content instead of system_instruction
+    """
+
+    def __init__(
+        self,
+        client: genai.Client,
+        model_name: str,
+        system_instruction: str,
+        tools: list,
+        conversation_store: ConversationStore,
+        user_store: UserStore,
+        safety_settings: list = None,
+        ttl_seconds: int = 3600,
+        cache_manager: Optional[ContextCacheManager] = None,  # Week 4
+    ):
+        self.client = client
+        self.model_name = model_name
+        self.system_instruction = system_instruction
+        self.tools = tools
+        self.safety_settings = safety_settings
+        self.conversation_store = conversation_store
+        self.user_store = user_store
+        self.ttl = timedelta(seconds=ttl_seconds)
+        self._sessions: Dict[str, Session] = {}
+        self._lock = asyncio.Lock()
+        self.cache_manager = cache_manager  # Week 4: Context caching
+
+    def _bson_to_sdk_history(self, bson_history: list) -> list:
+        """Convert BSON history to new SDK Content format
+
+        New SDK uses UserContent/ModelContent instead of dicts with 'role' key.
+        """
+        sdk_history = []
+        for entry in bson_history:
+            role = entry.get("role", "user")
+            parts = []
+
+            for part in entry.get("parts", []):
+                if "text" in part:
+                    parts.append(Part.from_text(text=part["text"]))
+                elif "function_call" in part:
+                    fc = part["function_call"]
+                    parts.append(Part.from_function_call(
+                        name=fc.get("name", ""),
+                        args=fc.get("args", {})
+                    ))
+                elif "function_response" in part:
+                    fr = part["function_response"]
+                    parts.append(Part.from_function_response(
+                        name=fr.get("name", ""),
+                        response=fr.get("response", {})
+                    ))
+
+            if parts:
+                if role == "user":
+                    sdk_history.append(UserContent(parts=parts))
+                else:  # model
+                    sdk_history.append(ModelContent(parts=parts))
+
+        return sdk_history
+
+    async def get_or_create_session(self, user_id: str, session_id: Optional[str] = None) -> Session:
+        """Get existing session or create new one
+
+        Args:
+            user_id: The user identifier
+            session_id: Optional specific session ID for multi-conversation support
+        """
+        # Use session_id as cache key if provided, otherwise use user_id
+        cache_key = session_id if session_id else user_id
+
+        async with self._lock:
+            # Check in-memory cache
+            if cache_key in self._sessions:
+                session = self._sessions[cache_key]
+                session.update_activity()
+                return session
+
+            # Load from MongoDB
+            history, loaded_session_id, summary = await self.conversation_store.load_history(
+                user_id,
+                session_id=session_id
+            )
+
+            # Use provided session_id or auto-generated one
+            final_session_id = session_id if session_id else loaded_session_id
+
+            # Convert BSON history to new SDK format
+            sdk_history = self._bson_to_sdk_history(history)
+
+            # WEEK 1 FIX: Inject summary as context if exists
+            # Previously this was just logged but never actually added to history!
+            if summary:
+                # Prepend summary as first user message for context
+                summary_content = UserContent(
+                    parts=[Part.from_text(text=f"[წინა საუბრის კონტექსტი: {summary}]")]
+                )
+                sdk_history = [summary_content] + sdk_history
+                logger.info(f"✅ Summary injected for {user_id}: {summary[:100]}...")
+
+            # Week 4: Check if context caching is available
+            use_cached_context = (
+                self.cache_manager is not None and
+                self.cache_manager.is_cache_valid
+            )
+
+            if use_cached_context:
+                # Use cached context - 85% token savings
+                cached_content_name = self.cache_manager.get_cached_content_name()
+                logger.info(f"🚀 Using cached context: {cached_content_name}")
+
+                # Config without system_instruction (it's in the cache)
+                # FIX: Add automatic_function_calling with increased limit (default is 10)
+                # Gemini 3 Flash Preview makes multiple function calls rapidly and exhausts the limit
+                chat_config = GenerateContentConfig(
+                    tools=self.tools,
+                    safety_settings=self.safety_settings if settings.enable_safety_settings else None,
+                    temperature=0.7,
+                    top_p=0.95,
+                    top_k=40,
+                    max_output_tokens=settings.max_output_tokens,
+                    thinking_config=ThinkingConfig(
+                        thinking_level=settings.thinking_level
+                    ),
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                        maximum_remote_calls=settings.max_function_calls
+                    ),
+                )
+
+                # Create chat with cached content
+                chat = self.client.aio.chats.create(
+                    model=self.model_name,
+                    history=sdk_history if sdk_history else None,
+                    config=chat_config,
+                )
+            else:
+                # Fallback: include full system instruction (no caching)
+                if self.cache_manager:
+                    self.cache_manager.record_cache_miss()
+                    logger.warning("⚠️ Context cache unavailable, using full system instruction")
+
+                # FIX: Add automatic_function_calling with increased limit (default is 10)
+                # Gemini 3 Flash Preview makes multiple function calls rapidly and exhausts the limit
+                chat_config = GenerateContentConfig(
+                    system_instruction=self.system_instruction,
+                    tools=self.tools,
+                    safety_settings=self.safety_settings if settings.enable_safety_settings else None,
+                    temperature=0.7,
+                    top_p=0.95,
+                    top_k=40,
+                    max_output_tokens=settings.max_output_tokens,
+                    thinking_config=ThinkingConfig(
+                        thinking_level=settings.thinking_level
+                    ),
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                        maximum_remote_calls=settings.max_function_calls
+                    ),
+                )
+
+                # Create async chat session (new SDK)
+                chat = self.client.aio.chats.create(
+                    model=self.model_name,
+                    history=sdk_history if sdk_history else None,
+                    config=chat_config,
+                )
+
+            session = Session(
+                user_id=user_id,
+                session_id=final_session_id,
+                chat=chat,
+                history=history,  # Keep BSON history for MongoDB persistence
+            )
+
+            self._sessions[cache_key] = session
+            return session
+
+    async def save_session(self, session: Session) -> None:
+        """Save session to MongoDB"""
+        # Get user profile for metadata
+        user = await self.user_store.get_user(session.user_id)
+
+        metadata = {
+            "language": "ka",
+            "last_topic": None,
+            "products_viewed": [],
+            "products_recommended": []
+        }
+
+        # Get history from chat session (new SDK)
+        try:
+            chat_history = session.chat.get_history()
+            # Convert SDK history back to BSON format for storage
+            bson_history = self._sdk_history_to_bson(chat_history)
+        except Exception as e:
+            logger.warning(f"Could not get chat history: {e}, using tracked history")
+            bson_history = session.history
+
+        await self.conversation_store.save_history(
+            user_id=session.user_id,
+            session_id=session.session_id,
+            history=bson_history,
+            metadata=metadata
+        )
+
+    def _sdk_history_to_bson(self, sdk_history: list) -> list:
+        """Convert SDK Content history back to BSON format for MongoDB storage"""
+        bson_history = []
+        for content in sdk_history:
+            role = "model" if isinstance(content, ModelContent) else "user"
+            # Handle both UserContent/ModelContent and generic Content
+            if hasattr(content, 'role'):
+                role = content.role
+
+            entry = {"role": role, "parts": []}
+
+            for part in content.parts:
+                if hasattr(part, 'text') and part.text:
+                    entry["parts"].append({"text": part.text})
+                elif hasattr(part, 'function_call') and part.function_call:
+                    entry["parts"].append({
+                        "function_call": {
+                            "name": part.function_call.name,
+                            "args": dict(part.function_call.args) if part.function_call.args else {}
+                        }
+                    })
+                elif hasattr(part, 'function_response') and part.function_response:
+                    entry["parts"].append({
+                        "function_response": {
+                            "name": part.function_response.name,
+                            "response": part.function_response.response
+                        }
+                    })
+
+            if entry["parts"]:
+                bson_history.append(entry)
+
+        return bson_history
+
+    async def clear_session(self, user_id: str) -> bool:
+        """Clear user session"""
+        async with self._lock:
+            if user_id in self._sessions:
+                session = self._sessions.pop(user_id)
+                await self.conversation_store.clear_session(session.session_id)
+                return True
+            return False
+
+    async def cleanup_stale_sessions(self) -> int:
+        """Remove expired sessions"""
+        now = datetime.utcnow()
+        expired = []
+
+        async with self._lock:
+            for user_id, session in self._sessions.items():
+                if now - session.last_activity > self.ttl:
+                    # Save before removing
+                    await self.save_session(session)
+                    expired.append(user_id)
+
+            for user_id in expired:
+                del self._sessions[user_id]
+
+        logger.info(f"Cleaned up {len(expired)} stale sessions")
+        return len(expired)
+
+# =============================================================================
+# GLOBAL INSTANCES
+# =============================================================================
+
+conversation_store = ConversationStore(
+    max_messages=settings.max_history_messages,
+    max_tokens=settings.max_history_tokens
+)
+user_store = UserStore()
+catalog_loader: Optional[CatalogLoader] = None
+session_manager: Optional[SessionManager] = None
+context_cache_manager: Optional[ContextCacheManager] = None  # Week 4
+cache_refresh_task: Optional[CacheRefreshTask] = None  # Week 4
+
+
+# =============================================================================
+# FASTAPI APP
+# =============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan manager"""
+    global catalog_loader, session_manager, context_cache_manager, cache_refresh_task
+
+    # Startup
+    logger.info("Starting Scoop GenAI server...")
+
+    # Connect to MongoDB
+    if settings.mongodb_uri:
+        await db_manager.connect(
+            settings.mongodb_uri,
+            settings.mongodb_database
+        )
+
+    # Initialize catalog loader
+    catalog_loader = CatalogLoader(
+        db=db_manager.db if settings.mongodb_uri else None,
+        cache_ttl_seconds=settings.catalog_cache_ttl_seconds
+    )
+
+    # Load catalog context - LEAN ARCHITECTURE: Use minimal summary
+    catalog_context = await catalog_loader.get_catalog_context(lean=True)
+    logger.info(f"Loaded lean catalog summary: ~{len(catalog_context)//4} tokens")
+
+    # Prepare system instruction with catalog context
+    full_system_instruction = SYSTEM_PROMPT + "\n\n" + catalog_context
+
+    # Set up tool stores with sync client for avoiding async loop conflicts
+    # FIX: Gemini function calling runs sync, so we need sync MongoDB client
+    from pymongo import MongoClient
+    sync_db = None
+    if settings.mongodb_uri:
+        sync_client = MongoClient(settings.mongodb_uri)
+        sync_db = sync_client[settings.mongodb_database]
+        logger.info("Initialized sync MongoDB client for tool functions")
+
+        # WARM-UP: Execute a simple query to establish connection pool
+        # This prevents "cold start" issues where first queries return 0 results
+        try:
+            warmup_count = sync_db.products.count_documents({"in_stock": True})
+            logger.info(f"🔥 MongoDB warm-up complete: {warmup_count} in-stock products")
+        except Exception as warmup_err:
+            logger.warning(f"⚠️ MongoDB warm-up failed: {warmup_err}")
+
+    set_stores(
+        user_store=user_store,
+        db=db_manager.db if settings.mongodb_uri else None,
+        sync_db=sync_db
+    )
+
+    # Week 4: Initialize context caching for 85% token savings
+    if settings.enable_context_caching:
+        logger.info("🚀 Week 4: Initializing context caching...")
+        context_cache_manager = ContextCacheManager(
+            client=gemini_client,
+            model_name=settings.model_name,
+            cache_ttl_minutes=settings.context_cache_ttl_minutes,
+        )
+
+        # Create initial cache
+        cache_success = await context_cache_manager.create_cache(
+            system_instruction=SYSTEM_PROMPT,
+            catalog_context=catalog_context,
+            display_name="scoop-context-cache"
+        )
+
+        if cache_success:
+            logger.info(
+                f"✅ Context cache created successfully "
+                f"(~{context_cache_manager.metrics.cached_token_count} tokens cached)"
+            )
+
+            # Start background cache refresh task
+            cache_refresh_task = CacheRefreshTask(
+                cache_manager=context_cache_manager,
+                refresh_before_expiry_minutes=settings.cache_refresh_before_expiry_minutes,
+                check_interval_minutes=settings.cache_check_interval_minutes,
+            )
+            await cache_refresh_task.start()
+        else:
+            logger.warning("⚠️ Context cache creation failed, running without caching")
+            context_cache_manager = None
+    else:
+        logger.info("Context caching disabled via settings")
+        context_cache_manager = None
+
+    # Initialize session manager (New SDK)
+    # ANSWER TO QUESTION #4: Automatic Function Calling Setup
+    # New SDK passes tools via config when creating chat sessions
+    session_manager = SessionManager(
+        client=gemini_client,
+        model_name=settings.model_name,
+        system_instruction=full_system_instruction,
+        tools=GEMINI_TOOLS,
+        conversation_store=conversation_store,
+        user_store=user_store,
+        safety_settings=SAFETY_SETTINGS,
+        ttl_seconds=settings.session_ttl_seconds,
+        cache_manager=context_cache_manager,  # Week 4
+    )
+
+    # Start cleanup task
+    cleanup_task = asyncio.create_task(cleanup_loop())
+
+    yield
+
+    # Shutdown
+    logger.info("Shutting down...")
+
+    # Stop cache refresh task
+    if cache_refresh_task:
+        await cache_refresh_task.stop()
+
+    # Delete context cache
+    if context_cache_manager:
+        await context_cache_manager.delete_cache()
+
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+
+    # Save all active sessions
+    for user_id, session in session_manager._sessions.items():
+        await session_manager.save_session(session)
+
+    await db_manager.disconnect()
+
+
+async def cleanup_loop():
+    """Background task to clean up stale sessions"""
+    while True:
+        await asyncio.sleep(300)  # 5 minutes
+        if session_manager:
+            await session_manager.cleanup_stale_sessions()
+
+
+app = FastAPI(
+    title="Scoop GenAI",
+    description="Sports Nutrition AI Consultant (Gemini SDK)",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# CORS - Security: Validate configuration
+cors_origins = settings.allowed_origins.split(",")
+if "*" in cors_origins and not settings.debug:
+    logger.warning(
+        "⚠️ SECURITY: CORS allows all origins (*) in production mode! "
+        "Set ALLOWED_ORIGINS env var to restrict access."
+    )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Rate Limiting
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+# =============================================================================
+# REQUEST/RESPONSE MODELS
+# =============================================================================
+
+class ChatRequest(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=128)
+    message: str = Field(..., min_length=1, max_length=4000)
+    session_id: Optional[str] = Field(None, max_length=128)  # For multi-conversation support
+
+    @field_validator('user_id')
+    @classmethod
+    def validate_user_id(cls, v: str) -> str:
+        import re
+        if not re.match(r'^[a-zA-Z0-9_-]+$', v):
+            raise ValueError('Invalid user_id format - only alphanumeric, underscore, and dash allowed')
+        return v
+
+    @field_validator('message')
+    @classmethod
+    def validate_message(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError('Message cannot be empty or whitespace only')
+        return v.strip()
+
+
+class ChatResponse(BaseModel):
+    response_text_geo: str
+    current_state: str = "CHAT"
+    quick_replies: list = []
+    picked_product_ids: list = []
+    carousel: Optional[dict] = None
+    success: bool = True
+    error: Optional[str] = None
+
+
+# =============================================================================
+# ADMIN AUTHENTICATION
+# =============================================================================
+
+async def verify_admin_token(x_admin_token: str = Header(None)) -> bool:
+    """Verify admin token for protected endpoints"""
+    if not settings.admin_token:
+        # If no admin token configured, block access entirely
+        raise HTTPException(status_code=403, detail="Admin access not configured")
+    if x_admin_token != settings.admin_token:
+        raise HTTPException(status_code=403, detail="Invalid admin token")
+    return True
+
+
+# =============================================================================
+# QUICK REPLIES PARSER
+# =============================================================================
+
+def parse_quick_replies(text: str) -> tuple[str, list]:
+    """
+    Extract quick replies from response text
+    
+    Primary format:
+    [QUICK_REPLIES]
+    Option 1
+    Option 2
+    [/QUICK_REPLIES]
+    
+    Fallback format (if primary not found):
+    **შემდეგი ნაბიჯი:**
+    - Option 1
+    - Option 2
+    """
+    # First: Clean up any leaked function call XML/code
+    # Gemini sometimes outputs function calls as text instead of proper API calls
+    text = clean_leaked_function_calls(text)
+    
+    # Primary: Look for [QUICK_REPLIES] tag
+    pattern = r'\[QUICK_REPLIES\](.*?)\[/QUICK_REPLIES\]'
+    match = re.search(pattern, text, re.DOTALL)
+
+    if match:
+        quick_text = match.group(1).strip()
+        quick_replies = [
+            {"title": line.strip(), "payload": line.strip()}
+            for line in quick_text.split("\n")
+            if line.strip()
+        ]
+        clean_text = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+        return clean_text, quick_replies
+    
+    # Fallback: Look for "შემდეგი ნაბიჯი:" section with bullet points
+    fallback_pattern = r'\*?\*?შემდეგი ნაბიჯი:?\*?\*?\s*\n+((?:[-•*]\s*.+\n?)+)'
+    fallback_match = re.search(fallback_pattern, text, re.IGNORECASE)
+    
+    if fallback_match:
+        bullet_text = fallback_match.group(1).strip()
+        quick_replies = []
+        
+        for line in bullet_text.split("\n"):
+            # Remove bullet point prefix (-, •, *)
+            clean_line = re.sub(r'^[-•*]\s*', '', line.strip())
+            if clean_line:
+                quick_replies.append({
+                    "title": clean_line,
+                    "payload": clean_line
+                })
+        
+        if quick_replies:
+            # Remove the "შემდეგი ნაბიჯი:" section from display text
+            clean_text = re.sub(fallback_pattern, '', text, flags=re.IGNORECASE).strip()
+            return clean_text, quick_replies
+    
+    # No quick replies found
+    return text, []
+
+
+def clean_leaked_function_calls(text: str) -> str:
+    """
+    Remove leaked function call XML/code from response text.
+    Gemini sometimes outputs function calls as text instead of proper API calls.
+    """
+    # Safety check - if text is None, return empty string
+    if text is None:
+        return ""
+    
+    # Remove <execute_function> tags
+    text = re.sub(r'<execute_function[^>]*/?>', '', text, flags=re.IGNORECASE | re.DOTALL)
+    
+    # Remove </execute_function> tags
+    text = re.sub(r'</execute_function>', '', text, flags=re.IGNORECASE)
+    
+    # Remove any partial function call syntax
+    text = re.sub(r'<\?xml[^>]*>', '', text)
+    text = re.sub(r'<function_calls>.*?</function_calls>', '', text, flags=re.DOTALL)
+    
+    # Remove print(...) statements that look like function calls
+    text = re.sub(r'print\([^)]+\)', '', text)
+    
+    # Remove any remaining XML-like function tags
+    text = re.sub(r'</?[a-z_]+[^>]*>', '', text, flags=re.IGNORECASE)
+    
+    # Clean up multiple newlines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
+    return text.strip()
+
+
+# =============================================================================
+# PRODUCT FORMAT INJECTION (Gemini 3 Flash Preview Fix)
+# =============================================================================
+
+def extract_search_products_results(response) -> list:
+    """
+    Extract products from search_products AFC results.
+
+    With automatic function calling, the SDK handles function execution internally.
+    We can access the history to find function call/response pairs.
+
+    Returns list of product dicts with keys:
+    - name, brand, price, servings, pricePerServing, description, buyLink
+    """
+    products = []
+
+    try:
+        # Access the chat history to find function responses
+        # The response object has candidates with content parts
+        for candidate in response.candidates:
+            for part in candidate.content.parts:
+                # Check for function response in part
+                if hasattr(part, 'function_response') and part.function_response:
+                    func_resp = part.function_response
+                    if func_resp.name == 'search_products':
+                        # Extract products from response
+                        response_data = func_resp.response
+                        if isinstance(response_data, dict) and 'products' in response_data:
+                            products.extend(response_data['products'])
+                        elif hasattr(response_data, 'get'):
+                            prods = response_data.get('products', [])
+                            if prods:
+                                products.extend(prods)
+    except Exception as e:
+        logger.warning(f"Failed to extract search_products results from response: {e}")
+
+    # Also try to get from chat history if available
+    # This catches products from earlier in the conversation
+
+    return products
+
+
+def has_valid_product_markdown(text: str) -> bool:
+    """
+    Check if response already has properly formatted products.
+    
+    Requires STRICT validation:
+    - At least 2 product name patterns (**Product Name**)
+    - At least 2 price metadata patterns (XX ₾ · XX პორცია)
+    - At least 2 buy links ([ყიდვა →])
+    
+    This prevents false positives from Gemini text with random bold patterns.
+    """
+    if not text:
+        return False
+
+    # Count product name patterns: **bold** text on its own line
+    product_name_pattern = r'^\*\*[^*]+\*\*\s*$'
+    name_matches = len(re.findall(product_name_pattern, text, re.MULTILINE))
+    
+    # Count price metadata: XX ₾ · XX პორცია
+    price_metadata_pattern = r'\*?\*?\d+(?:\.\d+)?\s*₾\*?\*?\s*·\s*\d+\s*პორცია'
+    price_matches = len(re.findall(price_metadata_pattern, text))
+    
+    # Count buy links: [ყიდვა →]
+    buy_link_pattern = r'\[ყიდვა →\]'
+    buy_link_matches = len(re.findall(buy_link_pattern, text))
+
+    # STRICT: Need at least 2 of EACH to confirm valid product format
+    # This prevents false positives from random bold text
+    is_valid = name_matches >= 2 and price_matches >= 2 and buy_link_matches >= 2
+
+    if is_valid:
+        logger.info(f"✅ Valid product markdown: {name_matches} names, {price_matches} prices, {buy_link_matches} buy links")
+    else:
+        logger.debug(f"❌ Invalid product markdown: {name_matches} names, {price_matches} prices, {buy_link_matches} buy links")
+
+    return is_valid
+
+
+def format_products_markdown(products: list, intro_text: str = "") -> str:
+    """
+    Generate properly formatted markdown for products.
+
+    Format:
+    **რეკომენდებული**
+    **Product Name (Size)**
+    *Brand*
+    **Price ₾** · Servings პორცია · PricePerServing ₾/პორცია
+    Description
+    [ყიდვა →](buyLink)
+
+    ---
+    """
+    if not products:
+        return ""
+
+    formatted = []
+    ranks = ['რეკომენდებული', 'ალტერნატივა', 'ბიუჯეტური']
+
+    for idx, product in enumerate(products[:3]):  # Max 3 products
+        rank = ranks[min(idx, len(ranks)-1)]
+
+        # Extract fields with fallbacks
+        name = product.get('name') or product.get('name_ka') or 'უცნობი პროდუქტი'
+        brand = product.get('brand') or ''
+        price = product.get('price') or 0
+        servings = product.get('servings') or 0
+
+        # Calculate price per serving if not provided
+        price_per_serving = 0
+        if servings and price:
+            price_per_serving = price / servings
+
+        # Get URL - try different field names
+        buy_link = (
+            product.get('url') or
+            product.get('product_url') or
+            product.get('buyLink') or
+            f"https://scoop.ge/search?q={name.replace(' ', '+')}"
+        )
+
+        # Generate description based on category if not provided
+        description = product.get('description') or ''
+        if not description:
+            # Generate contextual description based on product name
+            name_lower = name.lower()
+            if 'whey' in name_lower or 'პროტეინ' in name_lower:
+                description = 'მაღალი ხარისხის პროტეინი კუნთის ზრდისა და აღდგენისთვის.'
+            elif 'creatine' in name_lower or 'კრეატინ' in name_lower:
+                description = 'კრეატინი ძალისა და გამძლეობის გასაზრდელად.'
+            elif 'bcaa' in name_lower or 'ამინო' in name_lower:
+                description = 'ამინომჟავები კუნთის აღდგენისა და პროტეინის სინთეზისთვის.'
+            elif 'pre' in name_lower or 'ენერგ' in name_lower:
+                description = 'პრე-ვორკაუთი ენერგიისა და ფოკუსისთვის ვარჯიშის დროს.'
+            elif 'gainer' in name_lower or 'მასა' in name_lower:
+                description = 'გეინერი კალორიების და კუნთის მასის მოსაპოვებლად.'
+            else:
+                description = 'ხარისხიანი სპორტული დანამატი scoop.ge-დან.'
+
+        # Format product markdown
+        product_md = f"""**{rank}**
+**{name}**
+*{brand}*
+**{price:.0f} ₾** · {servings} პორცია · {price_per_serving:.2f} ₾/პორცია
+{description}
+[ყიდვა →]({buy_link})
+
+---"""
+
+        formatted.append(product_md)
+
+    return "\n\n".join(formatted)
+
+
+def extract_products_from_text(text: str) -> list:
+    """
+    Fallback: Extract product info from unformatted text when Gemini
+    doesn't call search_products but includes product info in response.
+
+    Looks for patterns like:
+    - "1. **Product Name** (XXX ლარი)"
+    - "1. **Product Name** - XXX ლარი"
+    - "1. **Product Name (Brand)** - XXX-YYY ლარი (ZZ პორცია)"
+
+    Returns list of product dicts with extracted info.
+    """
+    products = []
+
+    # Pattern: Numbered list with bold name, price can be in parens or after dash
+    # Captures: 1=name, 2=price (first number found after name)
+    # e.g., "1. **Critical Whey (Applied Nutrition)** - 253-260 ლარი (66 პორცია)"
+    # e.g., "1. **Nitro Tech (Muscletech)** - 299 ლარი (60 პორცია)"
+    # e.g., "3. **Mutant Whey** - 253 ლარი"
+    patterns = [
+        # === Numbered list patterns ===
+        # Pattern: "1. **Name** (size) - **253 ლარი**" (price in bold after dash)
+        r'\d+\.\s*\*\*([^*]+)\*\*[^*]*-\s*\*\*(\d+)(?:-\d+)?\s*(?:ლარი|₾)\*\*',
+        # Pattern: "1. **Name** - ... ფასი: **253 ლარი**"
+        r'\d+\.\s*\*\*([^*]+)\*\*[^*]*ფასი:\s*\*\*(\d+)(?:-\d+)?\s*(?:ლარი|₾)\*\*',
+        # Pattern: price in bold anywhere after name on same entry
+        r'\d+\.\s*\*\*([^*]+)\*\*.*?\*\*(\d+)(?:-\d+)?\s*(?:ლარი|₾)\*\*',
+        # Pattern: non-bold price directly after dash
+        r'\d+\.\s*\*\*([^*]+)\*\*\s*[-–—]\s*(\d+)(?:-\d+)?\s*(?:ლარი|₾)',
+        # Pattern: non-bold price in parentheses
+        r'\d+\.\s*\*\*([^*]+)\*\*\s*\((\d+(?:\.\d+)?)\s*(?:ლარი|₾)\)',
+
+        # === Bullet point patterns (*, -, •) ===
+        # Pattern: "* **Name** - XXX ლარი"
+        r'[\*\-•]\s*\*\*([^*]+)\*\*\s*[-–—]\s*(\d+)(?:-\d+)?\s*(?:ლარი|₾)',
+        # Pattern: "* **Name** (XXX ლარი)"
+        r'[\*\-•]\s*\*\*([^*]+)\*\*\s*\((\d+(?:\.\d+)?)\s*(?:ლარი|₾)\)',
+        # Pattern: "* **Name** - price in text" (looser match)
+        r'[\*\-•]\s*\*\*([^*]+)\*\*[^0-9\n]*?(\d{2,3})(?:-\d+)?\s*(?:ლარი|₾)',
+    ]
+
+    seen_names = set()
+
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            name = match.group(1).strip()
+            price = float(match.group(2))
+
+            # Skip if we've already seen this product
+            name_lower = name.lower()
+            if name_lower in seen_names:
+                continue
+            seen_names.add(name_lower)
+
+            # Try to find servings info nearby
+            servings = 0
+            # Look for "XX პორცია" near the product name
+            serving_pattern = rf'{re.escape(name)}[^0-9]*\((\d+)\s*პორცია\)'
+            serving_match = re.search(serving_pattern, text, re.IGNORECASE)
+            if serving_match:
+                servings = int(serving_match.group(1))
+            else:
+                # Try simpler pattern
+                simple_serving = re.search(rf'{re.escape(name[:20])}.*?(\d+)\s*პორცია', text)
+                if simple_serving:
+                    servings = int(simple_serving.group(1))
+
+            # Extract brand - check for known brands in name
+            brand = ""
+            brands = ['Mutant', 'Applied Nutrition', 'Applied', 'Optimum', 'Muscletech',
+                     'BioTech', 'Dymatize', 'MyProtein', 'BSN', 'Critical', 'Nitro']
+            for b in brands:
+                if b.lower() in name.lower():
+                    brand = b
+                    break
+
+            # Clean up product name - remove brand in parentheses
+            clean_name = re.sub(r'\s*\([^)]+\)\s*$', '', name).strip()
+
+            products.append({
+                'name': clean_name,
+                'brand': brand,
+                'price': price,
+                'servings': servings,
+                'url': f'https://scoop.ge/search?q={clean_name.replace(" ", "+")}'
+            })
+
+    if products:
+        logger.info(f"📝 Extracted {len(products)} products from text: {[p['name'] for p in products[:3]]}")
+
+    return products[:3]  # Max 3 products
+
+
+def ensure_product_format(response_text: str, products_data: list) -> str:
+    """
+    Inject properly formatted products if Gemini didn't use markdown format.
+    Similar to ensure_tip_tag().
+
+    This function:
+    1. Checks if response already has proper product markdown
+    2. If not, tries to extract products from text or uses products_data
+    3. Injects formatted markdown, preserving intro text
+    """
+    # Handle None response_text
+    if response_text is None:
+        response_text = ""
+    
+    # Check if already formatted correctly
+    if has_valid_product_markdown(response_text):
+        logger.info("✅ Products already in correct markdown format")
+        return response_text
+
+    # Try to get products from function call results first
+    final_products = products_data if products_data else []
+
+    # If no products from function calls, try to extract from text
+    if not final_products:
+        final_products = extract_products_from_text(response_text)
+
+    if not final_products:
+        logger.info("📦 No products to format")
+        return response_text
+
+    # Generate formatted markdown
+    formatted_products = format_products_markdown(final_products)
+
+    if not formatted_products:
+        return response_text
+
+    logger.warning(f"⚠️ Product markdown format missing - injecting {len(final_products)} formatted products")
+
+    # Strategy: Find intro text and insert products after it
+    # Look for first paragraph/sentence before any list or numbered content
+
+    # Split at first double newline or numbered list
+    intro_patterns = [
+        r'^(.+?)(?=\n\n|\n\d+\.|\n-\s)',  # Text before double newline or list
+        r'^(.+?\.)(?=\s)',  # First sentence
+    ]
+
+    intro = ""
+    rest = response_text
+
+    for pattern in intro_patterns:
+        match = re.match(pattern, response_text, re.DOTALL)
+        if match:
+            intro = match.group(1).strip()
+            rest = response_text[len(match.group(0)):].strip()
+            break
+
+    # If we couldn't find a good split point, use first 200 chars as intro
+    if not intro and len(response_text) > 200:
+        # Find a sentence break
+        period_pos = response_text.find('.', 50)
+        if period_pos > 0 and period_pos < 300:
+            intro = response_text[:period_pos + 1].strip()
+            rest = response_text[period_pos + 1:].strip()
+        else:
+            intro = ""
+            rest = response_text
+
+    # Build final response
+    if intro:
+        injected = f"{intro}\n\n{formatted_products}"
+    else:
+        injected = formatted_products
+
+    # Add any remaining content if it looks like a conclusion (not just more product text)
+    # Skip content that looks like plain product descriptions
+    if rest:
+        # Check if 'rest' is just more unformatted product text
+        has_product_indicators = any(x in rest.lower() for x in ['პროტეინ', 'კრეატინ', 'გეინერ', 'whey', 'bcaa'])
+        has_list_format = rest.strip().startswith(('1.', '2.', '-', '•'))
+
+        if not has_list_format and not (has_product_indicators and len(rest) > 100):
+            injected = f"{injected}\n\n{rest}"
+
+    logger.info(f"💉 Injected formatted products into response")
+
+    return injected
+
+
+# =============================================================================
+# TIP TAG INJECTION (Gemini 3 Flash Preview Fix)
+# =============================================================================
+
+def generate_contextual_tip(text: str) -> str:
+    """
+    Generate contextual tip based on response content.
+
+    Gemini 3 Flash Preview doesn't reliably generate [TIP] tags despite
+    system prompt instructions. This function generates appropriate tips
+    based on response content keywords.
+
+    Args:
+        text: The response text to analyze
+
+    Returns:
+        Contextual tip string (1-2 sentences in Georgian)
+    """
+    text_lower = text.lower()
+
+    # Product-specific tips mapped to keywords
+    contextual_tips = {
+        # Protein-related
+        'პროტეინ': 'პროტეინი მიიღეთ ვარჯიშის შემდეგ 30 წუთში მაქსიმალური ეფექტისთვის.',
+        'whey': 'whey პროტეინი საუკეთესოდ აღიწოვს ვარჯიშის შემდეგ.',
+        'isolate': 'isolate უფრო სწრაფად აღიწოვს და შეიცავს ნაკლებ ლაქტოზას.',
+
+        # Creatine-related
+        'კრეატინ': 'კრეატინი ყოველდღიურად მიიღეთ 3-5 გრამი, ვარჯიშის დღეებშიც და დასვენების დღეებშიც.',
+        'creatine': 'კრეატინის loading ფაზა არ არის სავალდებულო, შეგიძლიათ დაიწყოთ 3-5g/დღე.',
+
+        # Pre-workout
+        'პრე-ვორკ': 'პრე-ვორკაუთი ვარჯიშამდე 20-30 წუთით ადრე მიიღეთ.',
+        'pre-work': 'თავიდან აარიდეთ პრე-ვორკაუთი საღამოს, რათა ძილი არ დაირღვეს.',
+
+        # BCAA
+        'bcaa': 'BCAA ეფექტურია ცარიელ კუჭზე ვარჯიშის დროს.',
+        'ამინომჟავ': 'ამინომჟავები საუკეთესოდ მუშაობს ვარჯიშის დროს და შემდეგ.',
+
+        # Gainer
+        'გეინერ': 'გეინერი მიიღეთ ვარჯიშის შემდეგ და საჭიროების მიხედვით კვებებს შორის.',
+        'gainer': 'გეინერი 2-3 დოზად დაყავით დღეში კუჭის დისკომფორტის თავიდან ასაცილებლად.',
+
+        # Vitamins
+        'ვიტამინ': 'ვიტამინები უმჯობესია საკვებთან ერთად მიიღოთ შეწოვის გასაუმჯობესებლად.',
+        'vitamin': 'მულტივიტამინები დილით საკვებთან ერთად მიიღეთ.',
+
+        # Fat burners / Weight
+        'fat burn': 'fat burner-ების ეფექტურობისთვის აუცილებელია კალორიული დეფიციტი.',
+        'წონის კლება': 'წონის კლებისთვის მთავარია კალორიული დეფიციტი - დანამატები დამხმარე საშუალებაა.',
+        'წონა': 'წონის ცვლილებისთვის მთავარია კალორიების ბალანსი - დანამატები დამხმარე საშუალებაა.',
+        'მასა': 'კუნთოვანი მასის მოსაპოვებლად საჭიროა კალორიული სუფიციტი და საკმარისი პროტეინი.',
+        'კუნთ': 'კუნთის ზრდისთვის საჭიროა რეგულარული ვარჯიში, საკმარისი პროტეინი და დასვენება.',
+
+        # Hydration
+        'წყალი': 'დღეში მინიმუმ 2-3 ლიტრი წყალი მიიღეთ, განსაკუთრებით კრეატინის მიღებისას.',
+    }
+
+    # Find matching tip based on keywords
+    for keyword, tip in contextual_tips.items():
+        if keyword in text_lower:
+            logger.info(f"💡 Generated contextual tip for keyword: '{keyword}'")
+            return tip
+
+    # Default fallback tip
+    logger.info("💡 Using default generic tip (no keyword match)")
+    return 'რეკომენდაციებთან დაკავშირებით კითხვების შემთხვევაში მოგვწერეთ support@scoop.ge'
+
+
+def ensure_tip_tag(response_text: str) -> str:
+    """
+    Ensure response has [TIP] tag. If missing, inject contextual tip.
+
+    This is a safety net for Gemini 3 Flash Preview which doesn't reliably
+    generate [TIP] tags despite explicit system prompt instructions.
+    The frontend (parseProducts.ts) expects [TIP]...[/TIP] tags to render
+    the yellow "პრაქტიკული რჩევა" box.
+
+    Args:
+        response_text: The model's response text
+
+    Returns:
+        Response text with guaranteed [TIP] tag
+    """
+    # Safety check
+    if not response_text:
+        return response_text
+
+    # Check if TIP tag already exists
+    if '[TIP]' in response_text and '[/TIP]' in response_text:
+        logger.info("✅ [TIP] tag already present in response")
+        return response_text
+
+    logger.warning("⚠️ [TIP] tag missing from Gemini response - injecting contextual tip")
+
+    # Generate contextual tip based on response content
+    tip = generate_contextual_tip(response_text)
+
+    # Determine injection point
+    # CRITICAL: Inject BEFORE [QUICK_REPLIES] if it exists
+    if '[QUICK_REPLIES]' in response_text:
+        # Split at QUICK_REPLIES and insert TIP before it
+        parts = response_text.split('[QUICK_REPLIES]', 1)
+        injected = f"{parts[0].rstrip()}\n\n[TIP]\n{tip}\n[/TIP]\n\n[QUICK_REPLIES]{parts[1]}"
+        logger.info(f"💉 Injected TIP before [QUICK_REPLIES]: {tip[:60]}...")
+    else:
+        # Append TIP at the very end
+        injected = f"{response_text.rstrip()}\n\n[TIP]\n{tip}\n[/TIP]"
+        logger.info(f"💉 Appended TIP at end: {tip[:60]}...")
+
+    return injected
+
+
+# =============================================================================
+# ENDPOINTS
+# =============================================================================
+
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "service": "Scoop GenAI",
+        "version": "1.0.0",
+        "model": settings.model_name,
+        "status": "running"
+    }
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    db_status = await db_manager.ping() if settings.mongodb_uri else True
+
+    # Week 4: Include cache status
+    cache_status = "disabled"
+    if context_cache_manager:
+        cache_status = "active" if context_cache_manager.is_cache_valid else "expired"
+
+    return {
+        "status": "healthy" if db_status else "degraded",
+        "database": "connected" if db_status else "disconnected",
+        "model": settings.model_name,
+        "context_cache": cache_status,  # Week 4
+    }
+
+
+@app.get("/cache/metrics")
+async def cache_metrics(authorized: bool = Depends(verify_admin_token)):
+    """
+    Week 4: Get context cache metrics and cost savings.
+
+    Returns:
+        - Cache status (active/expired/disabled)
+        - Cached token count
+        - Cache hits/misses
+        - Estimated token savings
+        - Estimated cost savings in USD
+    """
+    if not context_cache_manager:
+        return {
+            "enabled": False,
+            "message": "Context caching is disabled"
+        }
+
+    metrics = await context_cache_manager.get_cache_info()
+    metrics["enabled"] = True
+
+    # Add cache hit rate
+    total_requests = metrics.get("cache_hits", 0) + metrics.get("cache_misses", 0)
+    if total_requests > 0:
+        metrics["cache_hit_rate"] = round(metrics["cache_hits"] / total_requests * 100, 2)
+    else:
+        metrics["cache_hit_rate"] = 0
+
+    return metrics
+
+
+@app.post("/cache/refresh")
+async def refresh_cache(authorized: bool = Depends(verify_admin_token)):
+    """
+    Week 4: Manually refresh the context cache.
+
+    Use when:
+    - Product catalog has been updated
+    - Cache needs to be regenerated
+    """
+    if not context_cache_manager:
+        raise HTTPException(status_code=400, detail="Context caching is disabled")
+
+    if not catalog_loader:
+        raise HTTPException(status_code=500, detail="Catalog loader not initialized")
+
+    # Get fresh catalog context
+    catalog_context = await catalog_loader.get_catalog_context(force_refresh=True)
+
+    # Refresh cache
+    success = await context_cache_manager.create_cache(
+        system_instruction=SYSTEM_PROMPT,
+        catalog_context=catalog_context,
+        display_name=f"scoop-context-cache-manual-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+    )
+
+    if success:
+        return {
+            "success": True,
+            "message": "Cache refreshed successfully",
+            "cached_tokens": context_cache_manager.metrics.cached_token_count,
+            "expires_at": context_cache_manager.metrics.cache_expires_at.isoformat()
+        }
+    else:
+        raise HTTPException(status_code=500, detail="Failed to refresh cache")
+
+
+@app.post("/chat", response_model=ChatResponse)
+@limiter.limit(f"{settings.rate_limit_per_minute}/minute")
+async def chat(request: Request, chat_request: ChatRequest):
+    """
+    Main chat endpoint using v2.0 ConversationEngine.
+
+    Flow:
+    1. Routes to unified ConversationEngine
+    2. Engine handles function calling with explicit user_id
+    3. Returns formatted response with products and quick replies
+    """
+    return await _chat_v2(chat_request)
+
+
+@app.post("/chat/stream")
+@limiter.limit(f"{settings.rate_limit_per_minute}/minute")
+async def chat_stream(request: Request, stream_request: ChatRequest):
+    """
+    SSE Streaming endpoint using v2.0 ConversationEngine.
+
+    Flow:
+    1. Routes to unified ConversationEngine
+    2. Engine handles function calling loop with manual FC
+    3. ThinkingManager provides UX feedback
+    4. Streams text chunks progressively
+    """
+    return await _chat_stream_v2(stream_request)
+
+
+@app.post("/session/clear")
+async def clear_session(user_id: str, authorized: bool = Depends(verify_admin_token)):
+    """Clear user session (admin only)"""
+    success = await session_manager.clear_session(user_id)
+    return {"success": success, "user_id": user_id}
+
+
+@app.get("/sessions")
+async def list_sessions(authorized: bool = Depends(verify_admin_token)):
+    """List active sessions (admin only)"""
+    sessions = []
+    for user_id, session in session_manager._sessions.items():
+        sessions.append({
+            "user_id": user_id,
+            "session_id": session.session_id,
+            "message_count": len(session.chat.history),
+            "created_at": session.created_at.isoformat(),
+            "last_activity": session.last_activity.isoformat()
+        })
+    return {"sessions": sessions, "count": len(sessions)}
+
+
+# =============================================================================
+# HISTORY RETRIEVAL ENDPOINTS (Public - for frontend sidebar)
+# =============================================================================
+
+@app.get("/sessions/{user_id}")
+async def get_user_sessions(user_id: str):
+    """
+    Get user's conversation sessions for sidebar display.
+    
+    Returns list of sessions with title and metadata.
+    """
+    # Validate user_id format
+    if not re.match(r'^[a-zA-Z0-9_-]+$', user_id):
+        raise HTTPException(status_code=400, detail="Invalid user_id format")
+    
+    sessions = await conversation_store.get_user_sessions(user_id, limit=20)
+    return {"sessions": sessions}
+
+
+@app.get("/session/{session_id}/history")
+async def get_session_history(session_id: str):
+    """
+    Get message history for a specific session.
+    
+    Returns formatted messages ready for frontend rendering.
+    """
+    # Validate session_id format
+    if not re.match(r'^[a-zA-Z0-9_-]+$', session_id):
+        raise HTTPException(status_code=400, detail="Invalid session_id format")
+    
+    messages = await conversation_store.get_session_history(session_id)
+    return {"messages": messages, "session_id": session_id}
+
+
+# =============================================================================
+# PRIVACY CONTROLS (GDPR Compliance)
+# =============================================================================
+
+@app.delete("/user/{user_id}/data")
+async def delete_user_data(user_id: str):
+    """
+    Delete all user data (GDPR Right to Erasure).
+    
+    Removes:
+    - All conversation history
+    - User profile and preferences
+    - Active sessions from memory
+    """
+    # Validate user_id format
+    if not re.match(r'^[a-zA-Z0-9_-]+$', user_id):
+        raise HTTPException(status_code=400, detail="Invalid user_id format")
+    
+    try:
+        # Delete all conversations
+        deleted_sessions = await conversation_store.clear_user_sessions(user_id)
+        
+        # Delete user profile
+        deleted_user = await user_store.delete_user(user_id)
+        
+        # Clear from memory cache
+        if session_manager:
+            # CRITICAL FIX: Cache keys use session_id, not user_id
+            # Must check Session.user_id property, not cache key pattern
+            keys_to_remove = []
+            for cache_key, session in list(session_manager._sessions.items()):
+                if session.user_id == user_id:
+                    keys_to_remove.append(cache_key)
+            
+            for key in keys_to_remove:
+                session_manager._sessions.pop(key, None)
+            
+            logger.info(f"Cleared {len(keys_to_remove)} cached sessions for user {user_id}")
+        
+        logger.info(f"Deleted data for user {user_id}: {deleted_sessions} sessions")
+        
+        return {
+            "success": True,
+            "deleted_sessions": deleted_sessions,
+            "deleted_profile": deleted_user,
+            "message": "ყველა მონაცემი წაიშალა"
+        }
+    except Exception as e:
+        logger.error(f"Error deleting user data: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete user data")
+
+
+# =============================================================================
+# v2.0 ENGINE HANDLERS (Feature Flag Controlled)
+# =============================================================================
+
+# Global v2 engine instance (lazy initialized)
+_v2_engine = None
+
+
+def _get_v2_engine():
+    """Get or create v2 engine singleton."""
+    global _v2_engine
+    if _v2_engine is None and settings.engine_version == "v2":
+        from app.core import (
+            ConversationEngine,
+            ConversationEngineConfig,
+        )
+        from app.tools.user_tools import GEMINI_TOOLS
+
+        config = ConversationEngineConfig(
+            model_name=settings.model_name,
+            max_function_rounds=settings.max_function_calls,
+            max_unique_queries=3,
+            gemini_timeout_seconds=settings.gemini_timeout_seconds,
+            max_output_tokens=settings.max_output_tokens,
+            retry_on_empty=True,
+            # Thinking UI: SIMPLE_LOADER provides immediate UX feedback
+            # without SDK bug #4090 issues
+            thinking_strategy="simple_loader",
+            thinking_delay_seconds=0.3,
+        )
+
+        _v2_engine = ConversationEngine(
+            gemini_api_key=settings.gemini_api_key,
+            system_instruction=SYSTEM_PROMPT,
+            tools=GEMINI_TOOLS,
+            config=config,
+        )
+
+        logger.info("🚀 v2.0 ConversationEngine initialized with ThinkingManager")
+
+    return _v2_engine
+
+
+async def _chat_v2(chat_request: ChatRequest) -> ChatResponse:
+    """
+    v2.0 Engine handler for /chat endpoint.
+
+    Uses the unified ConversationEngine with sync mode.
+    """
+    from app.core import ResponseMode
+
+    engine = _get_v2_engine()
+    if not engine:
+        logger.error("v2 engine not available despite ENGINE_VERSION=v2")
+        return ChatResponse(
+            response_text_geo="სისტემის შეცდომა. გთხოვთ სცადოთ მოგვიანებით.",
+            success=False,
+            error="engine_not_available"
+        )
+
+    logger.info(f"🚀 v2.0 Chat: user={chat_request.user_id}, session={chat_request.session_id}")
+
+    try:
+        result = await engine.process_message(
+            user_id=chat_request.user_id,
+            message=chat_request.message,
+            session_id=chat_request.session_id,
+            mode=ResponseMode.SYNC,
+        )
+
+        # Map ConversationResult to ChatResponse
+        return ChatResponse(
+            response_text_geo=result.text,
+            quick_replies=result.quick_replies,
+            success=result.success,
+            error=result.error_code,
+        )
+
+    except Exception as e:
+        error_id = uuid.uuid4().hex[:8]
+        logger.error(f"v2 Chat error [{error_id}]: {type(e).__name__}: {e}", exc_info=True)
+        return ChatResponse(
+            response_text_geo="დაფიქსირდა შეცდომა. გთხოვთ სცადოთ თავიდან.",
+            success=False,
+            error=f"internal_error:{error_id}"
+        )
+
+
+async def _chat_stream_v2(stream_request: ChatRequest) -> StreamingResponse:
+    """
+    v2.0 Engine handler for /chat/stream endpoint.
+
+    Uses the unified ConversationEngine with streaming mode.
+    """
+    import json
+
+    engine = _get_v2_engine()
+    if not engine:
+        async def error_stream():
+            yield f"data: {json.dumps({'type': 'error', 'content': 'Engine not available'})}\n\n"
+        return StreamingResponse(
+            error_stream(),
+            media_type="text/event-stream"
+        )
+
+    logger.info(f"🚀 v2.0 Stream: user={stream_request.user_id}, session={stream_request.session_id}")
+
+    async def generate():
+        try:
+            async for event in engine.stream_message(
+                user_id=stream_request.user_id,
+                message=stream_request.message,
+                session_id=stream_request.session_id,
+            ):
+                yield event.to_sse()
+
+        except Exception as e:
+            error_id = uuid.uuid4().hex[:8]
+            logger.error(f"v2 Stream error [{error_id}]: {type(e).__name__}: {e}", exc_info=True)
+            yield f"data: {json.dumps({'type': 'error', 'content': 'დაფიქსირდა შეცდომა', 'error_id': error_id})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
+        }
+    )
+
+
+# =============================================================================
+# RUN
+# =============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+
+    # Question #5: Cloud Run Compatibility
+    # - Set PORT env var for Cloud Run
+    # - Use 0.0.0.0 host
+    # - Consider min_instances=1 to avoid cold starts
+
+    uvicorn.run(
+        "main:app",
+        host=settings.host,
+        port=int(os.environ.get("PORT", settings.port)),
+        reload=settings.debug
+    )
