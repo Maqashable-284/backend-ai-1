@@ -43,7 +43,7 @@ docstring_parser==0.17.0
 emoji==2.15.0
 exceptiongroup==1.2.2
 face==24.0.0
-fastapi==0.109.0
+fastapi>=0.116.1
 fastuuid==0.14.0
 filelock==3.20.2
 filetype==1.2.0
@@ -236,7 +236,7 @@ srsly==2.5.2
 sse-starlette==3.1.2
 sseclient-py==1.9.0
 stanza==1.10.1
-starlette==0.52.1
+starlette>=0.40.0
 structlog==25.5.0
 sympy==1.14.0
 syncer==2.0.3
